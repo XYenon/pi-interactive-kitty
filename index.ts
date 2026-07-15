@@ -425,29 +425,33 @@ function shellQuote(value: string): string {
 
 function buildFileWatchCommand(fileWatch: Required<MonitorFileWatchConfig>): string {
 	const script = `
-const fs = require("node:fs");
-const watchPath = process.argv[1];
-const recursive = process.argv[2] === "1";
-const allowed = new Set((process.argv[3] || "rename,change").split(",").filter(Boolean));
-function emit(eventType, filename) {
-  if (!allowed.has(eventType)) return;
-  const name = filename ? String(filename) : ".";
-  process.stdout.write(eventType.toUpperCase() + " " + name + "\\n");
-}
-let watcher;
-try {
-  watcher = fs.watch(watchPath, { recursive }, (eventType, filename) => emit(eventType, filename));
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error("file-watch failed: " + message);
-  process.exit(1);
-}
-watcher.on("error", (error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error("file-watch error: " + message);
+import("node:fs").then((fs) => {
+  const watchPath = process.argv[1];
+  const recursive = process.argv[2] === "1";
+  const allowed = new Set((process.argv[3] || "rename,change").split(",").filter(Boolean));
+  function emit(eventType, filename) {
+    if (!allowed.has(eventType)) return;
+    const name = filename ? String(filename) : ".";
+    process.stdout.write(eventType.toUpperCase() + " " + name + "\\n");
+  }
+  let watcher;
+  try {
+    watcher = fs.watch(watchPath, { recursive }, (eventType, filename) => emit(eventType, filename));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("file-watch failed: " + message);
+    process.exit(1);
+  }
+  watcher.on("error", (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("file-watch error: " + message);
+    process.exit(1);
+  });
+  process.stdin.resume();
+}).catch((error) => {
+  console.error(error);
   process.exit(1);
 });
-process.stdin.resume();
 `.trim();
 
 	const encoded = Buffer.from(script, "utf8").toString("base64");

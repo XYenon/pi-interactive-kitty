@@ -2,6 +2,7 @@ import type { InteractiveShellConfig } from "./config.js";
 import type { OutputOptions, OutputResult } from "./session-manager.js";
 import type { InteractiveShellResult } from "./types.js";
 import type { TerminalSession } from "./terminal-session.js";
+import { capLinesByMaxChars } from "./session-log.js";
 
 /** Mutable query bookkeeping kept per active session. */
 export interface SessionQueryState {
@@ -55,7 +56,7 @@ export async function getSessionOutput(
 	}
 
 	if (completionOutput && opts.offset === undefined) {
-		return buildCompletionOutputResult(completionOutput);
+		return buildCompletionOutputResult(completionOutput, requestedLines, requestedMaxChars);
 	}
 
 	if (opts.offset !== undefined) {
@@ -207,11 +208,20 @@ async function getOffsetOutput(
 	};
 }
 
-function buildCompletionOutputResult(completionOutput: NonNullable<InteractiveShellResult["completionOutput"]>): OutputResult {
-	const output = completionOutput.lines.join("\n");
+function buildCompletionOutputResult(
+	completionOutput: NonNullable<InteractiveShellResult["completionOutput"]>,
+	requestedLines: number,
+	requestedMaxChars: number,
+): OutputResult {
+	const lines = completionOutput.lines;
+	const start = Math.max(0, lines.length - requestedLines);
+	const selected = lines.slice(start);
+	const capped = capLinesByMaxChars(selected, requestedMaxChars);
+	const output = capped.lines.join("\n");
+	const truncated = completionOutput.truncated || lines.length > requestedLines || capped.truncatedByChars;
 	return {
 		output,
-		truncated: completionOutput.truncated,
+		truncated,
 		totalBytes: output.length,
 		totalLines: completionOutput.totalLines,
 	};

@@ -74,7 +74,7 @@ describe("sessionCacheDirName / capLinesByMaxChars", () => {
 		vi.doMock("@mariozechner/pi-coding-agent", () => ({
 			getAgentDir: () => "/tmp/pi-agent-kitty-session-test",
 		}));
-		const { capLinesByMaxChars } = await import("../kitty-session.js");
+		const { capLinesByMaxChars } = await import("../session-log.js");
 		const long = "x".repeat(100);
 		const capped = capLinesByMaxChars([long, "next"], 10);
 		expect(capped.truncatedByChars).toBe(true);

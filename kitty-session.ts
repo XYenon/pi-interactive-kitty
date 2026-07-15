@@ -7,7 +7,7 @@ import type { InteractiveShellConfig } from "./config.js";
 import { KittyClient, type KittyWindow } from "./kitty-client.js";
 import { computeRewriteMonitorPayload, computeSnapshotDelta } from "./kitty-snapshot.js";
 import { isNamedKey } from "./key-encoding.js";
-import { sliceLogOutput, trimRawOutput } from "./session-log.js";
+import { sliceLogOutput, trimRawOutput, capLinesByMaxChars } from "./session-log.js";
 import type { TerminalSession, TerminalSessionEvents, TerminalSessionOptions } from "./terminal-session.js";
 
 export { computeSnapshotDelta, computeRewriteMonitorPayload } from "./kitty-snapshot.js";
@@ -778,26 +778,6 @@ export function sessionCacheDirName(sessionId: string): string {
  * Cap a list of lines so `lines.join("\n").length <= maxChars`.
  * Oversized single lines are sliced; omitted content sets truncatedByChars.
  */
-export function capLinesByMaxChars(lines: string[], maxChars: number): { lines: string[]; truncatedByChars: boolean } {
-	if (maxChars <= 0) return { lines: [], truncatedByChars: lines.length > 0 };
-	const out: string[] = [];
-	let used = 0;
-	for (const line of lines) {
-		const separator = out.length > 0 ? 1 : 0; // "\n" between lines
-		if (used + separator >= maxChars) {
-			return { lines: out, truncatedByChars: true };
-		}
-		const budget = maxChars - used - separator;
-		if (line.length > budget) {
-			const piece = line.slice(0, budget);
-			if (piece.length > 0) out.push(piece);
-			return { lines: out, truncatedByChars: true };
-		}
-		used += separator + line.length;
-		out.push(line);
-	}
-	return { lines: out, truncatedByChars: false };
-}
 
 function buildRunnerScript(command: string, exitFile: string, shell?: string): string {
 	const resolvedShell = shell ?? (process.platform === "win32" ? process.env.COMSPEC || "cmd.exe" : process.env.SHELL || "/bin/sh");
