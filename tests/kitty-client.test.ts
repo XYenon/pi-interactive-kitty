@@ -76,16 +76,23 @@ describe("KittyClient response handling", () => {
 		const { KittyClient } = await import("../kitty-client.js");
 		const client = new KittyClient({ kitty: { responseTimeoutMs: 5000 } } as any);
 		const rawResponse = '\x1bP@kitty-cmd{"ok":true}\x1b\\';
+		const request = Buffer.from("request");
 		class FakeSocket extends EventEmitter {
 			destroy = vi.fn();
-			end = vi.fn(() => {
+			end = vi.fn();
+			write = vi.fn(() => {
+				// Simulate kitty responding after the request is written (not after half-close).
 				queueMicrotask(() => this.emit("data", Buffer.from(rawResponse)));
+				return true;
 			});
 		}
 		const socket = new FakeSocket();
 		(client as any).openSocket = async () => socket;
 
-		await expect((client as any).sendAndReceive(Buffer.from("request"))).resolves.toBe(rawResponse);
+		await expect((client as any).sendAndReceive(request)).resolves.toBe(rawResponse);
+		expect(socket.write).toHaveBeenCalledWith(request);
+		// Must not half-close: Bun drops the response if we socket.end(payload).
+		expect(socket.end).not.toHaveBeenCalled();
 		expect(socket.destroy).toHaveBeenCalledTimes(1);
 	});
 
@@ -94,14 +101,18 @@ describe("KittyClient response handling", () => {
 		const client = new KittyClient({ kitty: { responseTimeoutMs: 5000 } } as any);
 		class FakeSocket extends EventEmitter {
 			destroy = vi.fn();
-			end = vi.fn(() => {
+			end = vi.fn();
+			write = vi.fn(() => {
 				queueMicrotask(() => this.emit("end"));
+				return true;
 			});
 		}
 		const socket = new FakeSocket();
 		(client as any).openSocket = async () => socket;
 
 		await expect((client as any).sendAndReceive(Buffer.from("request"))).resolves.toBe("");
+		expect(socket.write).toHaveBeenCalled();
+		expect(socket.end).not.toHaveBeenCalled();
 		expect(socket.destroy).toHaveBeenCalledTimes(1);
 	});
 
@@ -110,14 +121,18 @@ describe("KittyClient response handling", () => {
 		const client = new KittyClient({ kitty: { responseTimeoutMs: 5000 } } as any);
 		class FakeSocket extends EventEmitter {
 			destroy = vi.fn();
-			end = vi.fn(() => {
+			end = vi.fn();
+			write = vi.fn(() => {
 				queueMicrotask(() => this.emit("error", new Error("boom")));
+				return true;
 			});
 		}
 		const socket = new FakeSocket();
 		(client as any).openSocket = async () => socket;
 
 		await expect((client as any).sendAndReceive(Buffer.from("request"))).rejects.toThrow("boom");
+		expect(socket.write).toHaveBeenCalled();
+		expect(socket.end).not.toHaveBeenCalled();
 		expect(socket.destroy).toHaveBeenCalledTimes(1);
 	});
 

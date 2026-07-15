@@ -380,7 +380,12 @@ export class KittyClient {
 					resolve(buffered());
 				});
 			});
-			socket.end(payload);
+			// Pitfall (Bun): `socket.end(payload)` half-closes the write side. Node still
+			// delivers kitty's DCS response afterward, but Bun 1.3.x fires `end` with an
+			// empty buffer and never emits `data` — so ls/launch/load-config all fail when
+			// the extension runs under Bun (pi's process.execPath). Write without ending;
+			// destroy once we have a complete response, timeout, error, or peer close.
+			socket.write(payload);
 		});
 	}
 
