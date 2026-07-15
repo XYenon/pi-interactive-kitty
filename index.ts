@@ -13,6 +13,7 @@ import type {
 	MonitorTriggerConfig,
 } from "./types.js";
 import { sessionManager, generateSessionId, releaseSessionId } from "./session-manager.js";
+import type { ActiveSession, ActiveSessionResult, BackgroundSession } from "./session-manager.js";
 import { loadConfig } from "./config.js";
 import type { InteractiveShellConfig } from "./config.js";
 import { parseSpawnArgs, resolveSpawn, type SpawnRequest } from "./spawn.js";
@@ -31,11 +32,10 @@ import {
 	buildResultNotification,
 	summarizeInteractiveResult,
 } from "./notification-utils.js";
-import { createSessionQueryState, getSessionOutput } from "./session-query.js";
+import { getSessionOutput } from "./session-query.js";
 import { InteractiveShellCoordinator } from "./runtime-coordinator.js";
 import { captureCompletionOutput, maybeBuildHandoffPreview, maybeWriteHandoffSnapshot } from "./handoff-utils.js";
 import { spawn as spawnChildProcess } from "node:child_process";
-import type { ActiveSessionResult } from "./session-manager.js";
 
 const coordinator = new InteractiveShellCoordinator();
 
@@ -776,7 +776,9 @@ function registerHeadlessActive(
 	status: "running" | "monitoring" = "running",
 	storedResult?: { current: ActiveSessionResult | undefined },
 ): void {
-	const queryState = createSessionQueryState();
+	// Share query state with attach / post-unregister sessionId fallback so incremental
+	// cursors survive the active → background-only transition after the first result poll.
+	const queryState = sessionManager.getQueryState(id);
 	coordinator.setMonitor(id, monitor);
 	const getCompletionOutput = () => storedResult?.current?.completionOutput ?? monitor.getResult()?.completionOutput;
 
@@ -837,7 +839,7 @@ function registerHandsFreeActive(
 	},
 	storedResult: { current: ActiveSessionResult | undefined },
 ): void {
-	const queryState = createSessionQueryState();
+	const queryState = sessionManager.getQueryState(id);
 	coordinator.setMonitor(id, monitor);
 
 	let updateMode = options.updateMode;
@@ -1017,7 +1019,7 @@ function registerRunningActive(
 	onComplete: () => void,
 	storedResult?: { current: ActiveSessionResult | undefined },
 ): void {
-	const queryState = createSessionQueryState();
+	const queryState = sessionManager.getQueryState(id);
 	sessionManager.registerActive({
 		id,
 		command,
@@ -1150,6 +1152,72 @@ function makeNonBlockingUpdateHandler(pi: ExtensionAPI): (update: HandsFreeUpdat
 function appendWorktreeNotice(text: string, worktreePath: string | undefined): string {
 	if (!worktreePath) return text;
 	return `${text}\nWorktree left in place: ${worktreePath}`;
+}
+
+/**
+ * Resolve a sessionId against the active table first, then background.
+ * After the first completed-status poll unregisters active (agent-poll semantics),
+ * subsequent sessionId / incremental / drain queries must still reach the kitty tab
+ * via the background entry (P-1).
+ */
+function resolveSessionById(sessionId: string): {
+	active: ActiveSession | undefined;
+	background: BackgroundSession | undefined;
+} {
+	const active = sessionManager.getActive(sessionId);
+	const background = sessionManager.hasBackground(sessionId) ? sessionManager.get(sessionId) : undefined;
+	return { active, background };
+}
+
+/** After background reads, resume delayed cleanup when no headless monitor owns the session. */
+function maybeRestartBackgroundCleanup(sessionId: string): void {
+	const monitor = coordinator.getMonitor(sessionId);
+	if (!monitor || monitor.disposed) {
+		sessionManager.restartAutoCleanup(sessionId);
+	}
+}
+
+async function queryBackgroundSessionOutput(
+	sessionId: string,
+	bg: BackgroundSession,
+	ctxCwd: string,
+	opts: {
+		outputLines?: number;
+		outputMaxChars?: number;
+		outputOffset?: number;
+		drain?: boolean;
+		incremental?: boolean;
+		skipRateLimit?: boolean;
+	},
+): Promise<{
+	status: string;
+	runtime: number;
+	output: string;
+	truncated: boolean;
+	totalBytes: number;
+	totalLines?: number;
+	hasMore?: boolean;
+}> {
+	const config = loadConfig(ctxCwd);
+	const queryState = sessionManager.getQueryState(sessionId);
+	const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(bg.session, config, queryState, {
+		skipRateLimit: opts.skipRateLimit ?? true,
+		lines: opts.outputLines,
+		maxChars: opts.outputMaxChars,
+		offset: opts.outputOffset,
+		drain: opts.drain,
+		incremental: opts.incremental,
+	});
+	maybeRestartBackgroundCleanup(sessionId);
+	return {
+		status: bg.session.exited ? "exited" : "running",
+		runtime: Date.now() - bg.startedAt.getTime(),
+		output,
+		truncated,
+		totalBytes,
+		totalLines,
+		hasMore,
+	};
 }
 
 export default function interactiveShellExtension(pi: ExtensionAPI) {
@@ -1882,8 +1950,10 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 
 			// ── Branch 1: Interact with existing session ──
 			if (sessionId) {
-				const session = sessionManager.getActive(sessionId);
-				if (!session) {
+				const resolved = resolveSessionById(sessionId);
+				const session = resolved.active;
+				const bgSession = resolved.background;
+				if (!session && !bgSession) {
 					return {
 						content: [{ type: "text", text: `Session not found or no longer active: ${sessionId}` }],
 						isError: true,
@@ -1893,19 +1963,84 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 
 				// Kill
 				if (kill) {
-					const alreadyCompleted = Boolean(session.getResult());
-					if (!alreadyCompleted) {
-						// Suppress the automatic completion turn; this tool call is the response.
-						coordinator.markAgentHandledCompletion(sessionId);
-					}
-					const status = session.getStatus();
-					const runtime = session.getRuntime();
 					const killConfig = loadRuntimeConfig(ctx.cwd);
-					const bgSession = sessionManager.get(sessionId);
 					const liveMonitor = coordinator.getMonitor(sessionId);
 
-					// Prefer the headless completion pipeline so storedResult / monitor state finalize.
-					if (liveMonitor && !liveMonitor.disposed && !alreadyCompleted) {
+					if (session) {
+						const alreadyCompleted = Boolean(session.getResult());
+						if (!alreadyCompleted) {
+							// Suppress the automatic completion turn; this tool call is the response.
+							coordinator.markAgentHandledCompletion(sessionId);
+						}
+						const status = session.getStatus();
+						const runtime = session.getRuntime();
+
+						// Prefer the headless completion pipeline so storedResult / monitor state finalize.
+						if (liveMonitor && !liveMonitor.disposed && !alreadyCompleted) {
+							await new Promise<void>((resolve) => {
+								let done = false;
+								const finishWait = () => {
+									if (done) return;
+									done = true;
+									resolve();
+								};
+								liveMonitor.registerCompleteCallback(finishWait);
+								liveMonitor.cancel();
+								// Bound wait: cancel kicks session.kill() which may take killGraceMs.
+								const graceMs = Math.min(killConfig.kitty?.killGraceMs ?? 5000, 5000);
+								setTimeout(finishWait, graceMs + 500);
+							});
+						} else {
+							session.kill();
+						}
+
+						const { output, truncated, totalBytes, totalLines, hasMore } = await session.getOutput({
+							skipRateLimit: true,
+							lines: outputLines,
+							maxChars: outputMaxChars,
+							offset: outputOffset,
+							drain,
+							incremental,
+						});
+						const killHandoff =
+							(await buildRegisteredHandoffArtifacts(sessionId, "kill")) ??
+							(bgSession
+								? await buildHandoffArtifacts(bgSession.session, "kill", killConfig, { command: session.command, cwd: ctx.cwd })
+								: {});
+						// Completion callbacks may already have unregistered; make cleanup idempotent.
+						sessionManager.unregisterActive(sessionId, true);
+						coordinator.disposeMonitor(sessionId);
+						clearHandoffContext(sessionId);
+						sessionManager.scheduleCleanup(sessionId, 5 * 60 * 1000);
+						scheduleMonitorHistoryCleanup(sessionId);
+
+						const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} killed after ${formatDurationMs(runtime)}${output ? `\n\nFinal output${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+								},
+							],
+							details: {
+								sessionId,
+								status: "killed",
+								runtime,
+								output,
+								outputTruncated: truncated,
+								outputTotalBytes: totalBytes,
+								outputTotalLines: totalLines,
+								hasMore,
+								previousStatus: status,
+								...killHandoff,
+							},
+						};
+					}
+
+					// Background-only kill (active already unregistered after first result poll).
+					const entry = bgSession!;
+					const runtime = Date.now() - entry.startedAt.getTime();
+					if (liveMonitor && !liveMonitor.disposed) {
 						await new Promise<void>((resolve) => {
 							let done = false;
 							const finishWait = () => {
@@ -1915,52 +2050,46 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							};
 							liveMonitor.registerCompleteCallback(finishWait);
 							liveMonitor.cancel();
-							// Bound wait: cancel kicks session.kill() which may take killGraceMs.
 							const graceMs = Math.min(killConfig.kitty?.killGraceMs ?? 5000, 5000);
 							setTimeout(finishWait, graceMs + 500);
 						});
-					} else {
-						session.kill();
+					} else if (!entry.session.exited) {
+						entry.session.kill();
 					}
-
-					const { output, truncated, totalBytes, totalLines, hasMore } = await session.getOutput({
-						skipRateLimit: true,
-						lines: outputLines,
-						maxChars: outputMaxChars,
-						offset: outputOffset,
+					const queried = await queryBackgroundSessionOutput(sessionId, entry, ctx.cwd, {
+						outputLines,
+						outputMaxChars,
+						outputOffset,
 						drain,
 						incremental,
+						skipRateLimit: true,
 					});
 					const killHandoff =
 						(await buildRegisteredHandoffArtifacts(sessionId, "kill")) ??
-						(bgSession
-							? await buildHandoffArtifacts(bgSession.session, "kill", killConfig, { command: session.command, cwd: ctx.cwd })
-							: {});
-					// Completion callbacks may already have unregistered; make cleanup idempotent.
+						(await buildHandoffArtifacts(entry.session, "kill", killConfig, { command: entry.command, cwd: ctx.cwd }));
 					sessionManager.unregisterActive(sessionId, true);
 					coordinator.disposeMonitor(sessionId);
 					clearHandoffContext(sessionId);
 					sessionManager.scheduleCleanup(sessionId, 5 * 60 * 1000);
 					scheduleMonitorHistoryCleanup(sessionId);
-
-					const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
+					const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Session ${sessionId} killed after ${formatDurationMs(runtime)}${output ? `\n\nFinal output${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+								text: `Session ${sessionId} killed after ${formatDurationMs(runtime)}${queried.output ? `\n\nFinal output${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
 							},
 						],
 						details: {
 							sessionId,
 							status: "killed",
 							runtime,
-							output,
-							outputTruncated: truncated,
-							outputTotalBytes: totalBytes,
-							outputTotalLines: totalLines,
-							hasMore,
-							previousStatus: status,
+							output: queried.output,
+							outputTruncated: queried.truncated,
+							outputTotalBytes: queried.totalBytes,
+							outputTotalLines: queried.totalLines,
+							hasMore: queried.hasMore,
+							previousStatus: queried.status,
 							...killHandoff,
 						},
 					};
@@ -1968,6 +2097,18 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 
 				// Background
 				if (background) {
+					if (!session) {
+						// Already background-managed (or completed after active unregister).
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} is already managed in kitty; use attach/focus to watch it. Background is a no-op for kitty sessions.`,
+								},
+							],
+							details: { sessionId, alreadyManaged: true },
+						};
+					}
 					if (session.getResult()) {
 						return {
 							content: [{ type: "text", text: "Session already completed." }],
@@ -2005,21 +2146,60 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				if (settings?.updateInterval !== undefined) {
 					if (sessionManager.setActiveUpdateInterval(sessionId, settings.updateInterval)) {
 						actions.push(`update interval set to ${settings.updateInterval}ms`);
+					} else if (!session) {
+						return {
+							content: [
+								{ type: "text", text: `Cannot change settings on session ${sessionId}: no longer active (query via sessionId or attach).` },
+							],
+							isError: true,
+							details: { sessionId, error: "settings_not_active" },
+						};
 					}
 				}
 				if (settings?.quietThreshold !== undefined) {
 					if (sessionManager.setActiveQuietThreshold(sessionId, settings.quietThreshold)) {
 						actions.push(`quiet threshold set to ${settings.quietThreshold}ms`);
+					} else if (!session && settings?.updateInterval === undefined) {
+						return {
+							content: [
+								{ type: "text", text: `Cannot change settings on session ${sessionId}: no longer active (query via sessionId or attach).` },
+							],
+							isError: true,
+							details: { sessionId, error: "settings_not_active" },
+						};
 					}
 				}
 
 				if (effectiveInput !== undefined || submit) {
-					const success = await sendStructuredInput(session, sessionId, effectiveInput, submit);
-					if (!success) {
+					if (session) {
+						const success = await sendStructuredInput(session, sessionId, effectiveInput, submit);
+						if (!success) {
+							return {
+								content: [{ type: "text", text: `Failed to send input to session: ${sessionId}` }],
+								isError: true,
+								details: { sessionId, error: "write_failed" },
+							};
+						}
+					} else if (bgSession && !bgSession.session.exited) {
+						// Active unregistered but kitty tab still running — send via terminal bindings.
+						const success = await sendStructuredInput(
+							{ ...sessionIoBindings(bgSession.session), id: sessionId } as ActiveSession,
+							sessionId,
+							effectiveInput,
+							submit,
+						);
+						if (!success) {
+							return {
+								content: [{ type: "text", text: `Failed to send input to session: ${sessionId}` }],
+								isError: true,
+								details: { sessionId, error: "write_failed" },
+							};
+						}
+					} else {
 						return {
-							content: [{ type: "text", text: `Failed to send input to session: ${sessionId}` }],
+							content: [{ type: "text", text: `Cannot send input to session ${sessionId}: session is no longer active.` }],
 							isError: true,
-							details: { sessionId, error: "write_failed" },
+							details: { sessionId, error: "input_not_active" },
 						};
 					}
 					const inputDesc = describeInputPayload(effectiveInput);
@@ -2031,12 +2211,45 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				}
 
 				if (actions.length === 0) {
-					const status = session.getStatus();
-					const runtime = session.getRuntime();
-					const result = session.getResult();
+					// Background-only query path (after first completed poll unregistered active).
+					if (!session && bgSession) {
+						const queried = await queryBackgroundSessionOutput(sessionId, bgSession, ctx.cwd, {
+							outputLines,
+							outputMaxChars,
+							outputOffset,
+							drain,
+							incremental,
+							skipRateLimit: true,
+						});
+						const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} ${queried.status} (${formatDurationMs(queried.runtime)})${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+								},
+							],
+							details: {
+								sessionId,
+								status: queried.status,
+								runtime: queried.runtime,
+								output: queried.output,
+								outputTruncated: queried.truncated,
+								outputTotalBytes: queried.totalBytes,
+								outputTotalLines: queried.totalLines,
+								hasMore: queried.hasMore,
+								hasOutput: queried.output.length > 0,
+							},
+						};
+					}
+
+					const activeSession = session!;
+					const status = activeSession.getStatus();
+					const runtime = activeSession.getRuntime();
+					const result = activeSession.getResult();
 
 					if (result) {
-						const { output, truncated, totalBytes, totalLines, hasMore } = await session.getOutput({
+						const { output, truncated, totalBytes, totalLines, hasMore } = await activeSession.getOutput({
 							skipRateLimit: true,
 							lines: outputLines,
 							maxChars: outputMaxChars,
@@ -2045,6 +2258,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							incremental,
 						});
 						const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
+						// Drop active after first result poll; further sessionId queries use background fallback.
 						sessionManager.unregisterActive(sessionId, result.backgrounded === false);
 						clearHandoffContext(sessionId);
 						return {
@@ -2064,7 +2278,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						};
 					}
 
-					const outputResult = await session.getOutput({
+					const outputResult = await activeSession.getOutput({
 						lines: outputLines,
 						maxChars: outputMaxChars,
 						offset: outputOffset,
@@ -2076,12 +2290,44 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						const waitMs = outputResult.waitSeconds * 1000;
 						const completedEarly = await Promise.race([
 							new Promise<false>((resolve) => setTimeout(() => resolve(false), waitMs)),
-							new Promise<true>((resolve) => session.onComplete(() => resolve(true))),
+							new Promise<true>((resolve) => activeSession.onComplete(() => resolve(true))),
 						]);
 
 						if (completedEarly) {
 							const earlySession = sessionManager.getActive(sessionId);
 							if (!earlySession) {
+								// Completion may have raced unregister; fall back to background if present.
+								const fallbackBg = sessionManager.hasBackground(sessionId) ? sessionManager.get(sessionId) : undefined;
+								if (fallbackBg) {
+									const queried = await queryBackgroundSessionOutput(sessionId, fallbackBg, ctx.cwd, {
+										outputLines,
+										outputMaxChars,
+										outputOffset,
+										drain,
+										incremental,
+										skipRateLimit: true,
+									});
+									const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
+									return {
+										content: [
+											{
+												type: "text",
+												text: `Session ${sessionId} ${queried.status} (${formatDurationMs(queried.runtime)})${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+											},
+										],
+										details: {
+											sessionId,
+											status: queried.status,
+											runtime: queried.runtime,
+											output: queried.output,
+											outputTruncated: queried.truncated,
+											outputTotalBytes: queried.totalBytes,
+											outputTotalLines: queried.totalLines,
+											hasMore: queried.hasMore,
+											hasOutput: queried.output.length > 0,
+										},
+									};
+								}
 								return { content: [{ type: "text", text: `Session ${sessionId} ended` }], details: { sessionId, status: "ended" } };
 							}
 							const earlyResult = earlySession.getResult();
@@ -2136,7 +2382,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							};
 						}
 
-						const freshOutput = await session.getOutput({
+						const freshOutput = await activeSession.getOutput({
 							lines: outputLines,
 							maxChars: outputMaxChars,
 							offset: outputOffset,
@@ -2144,9 +2390,9 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							incremental,
 						});
 						const { truncatedNote, hasMoreNote } = outputDisplayNotes(freshOutput.truncated, freshOutput.totalBytes, freshOutput.hasMore);
-						const freshStatus = session.getStatus();
-						const freshRuntime = session.getRuntime();
-						const freshResult = session.getResult();
+						const freshStatus = activeSession.getStatus();
+						const freshRuntime = activeSession.getRuntime();
+						const freshResult = activeSession.getResult();
 						if (freshResult) {
 							sessionManager.unregisterActive(sessionId, freshResult.backgrounded === false);
 							clearHandoffContext(sessionId);

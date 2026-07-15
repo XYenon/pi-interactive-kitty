@@ -14,6 +14,8 @@ async function setupHarness(initialSessions: MockBackgroundSession[]) {
 	const sessionManager = {
 		list: vi.fn(() => sessions),
 		get: vi.fn(() => undefined),
+		hasBackground: vi.fn(() => false),
+		getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),
 		take: vi.fn(() => undefined),
 		restore: vi.fn(),
 		remove: vi.fn(),

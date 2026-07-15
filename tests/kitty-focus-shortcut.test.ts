@@ -37,6 +37,8 @@ async function setupHarness(): Promise<Harness> {
 			writeToActive: vi.fn(() => false),
 			list: vi.fn(() => [backgroundSession]),
 			get: vi.fn(() => undefined),
+			hasBackground: vi.fn(() => false),
+			getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),
 			take: vi.fn(() => undefined),
 			restore: vi.fn(),
 			remove: vi.fn(),

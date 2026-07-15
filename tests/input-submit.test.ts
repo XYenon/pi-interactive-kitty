@@ -16,6 +16,8 @@ async function setupHarness() {
 		add: vi.fn(() => "mock-session-id"),
 		list: vi.fn(() => []),
 		get: vi.fn(() => undefined),
+		hasBackground: vi.fn(() => false),
+		getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),
 		take: vi.fn(() => undefined),
 		restore: vi.fn(),
 		remove: vi.fn(),

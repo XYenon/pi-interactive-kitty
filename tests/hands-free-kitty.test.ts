@@ -207,6 +207,8 @@ async function setupHarness(options?: { onCompleteInfos?: HeadlessCompletionInfo
 			add: vi.fn(() => "bg-session"),
 			take: vi.fn(() => undefined),
 			get: vi.fn(() => undefined),
+			hasBackground: vi.fn(() => false),
+			getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),
 			restore: vi.fn(),
 			remove: vi.fn(),
 			scheduleCleanup,
