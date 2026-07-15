@@ -204,6 +204,83 @@ function completedSessionQueryDetails(
 	};
 }
 
+function buildCompletedSessionResponse(
+	sessionId: string,
+	status: string,
+	runtime: number,
+	outputResult: { output: string; truncated: boolean; totalBytes: number; totalLines?: number; hasMore?: boolean },
+	result: ActiveSessionResult,
+): {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+} {
+	const { truncatedNote, hasMoreNote } = outputDisplayNotes(outputResult.truncated, outputResult.totalBytes, outputResult.hasMore);
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Session ${sessionId} ${status} after ${formatDurationMs(runtime)}${outputResult.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${outputResult.output}` : ""}`,
+			},
+		],
+		details: completedSessionQueryDetails(sessionId, status, runtime, outputResult, result),
+	};
+}
+
+async function getBackgroundOutputResponse(
+	sessionId: string,
+	bgSession: BackgroundSession,
+	cwd: string,
+	opts: {
+		outputLines?: number;
+		outputMaxChars?: number;
+		outputOffset?: number;
+		drain?: boolean;
+		incremental?: boolean;
+	},
+): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}> {
+	const queried = await queryBackgroundSessionOutput(sessionId, bgSession, cwd, opts);
+	const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
+	const outputBlock = {
+		output: queried.output,
+		truncated: queried.truncated,
+		totalBytes: queried.totalBytes,
+		totalLines: queried.totalLines,
+		hasMore: queried.hasMore,
+	};
+	if (queried.lastResult) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Session ${sessionId} ${queried.status} after ${formatDurationMs(queried.runtime)}${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+				},
+			],
+			details: completedSessionQueryDetails(sessionId, queried.status, queried.runtime, outputBlock, queried.lastResult),
+		};
+	}
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Session ${sessionId} ${queried.status} (${formatDurationMs(queried.runtime)})${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+			},
+		],
+		details: {
+			sessionId,
+			status: queried.status,
+			runtime: queried.runtime,
+			...outputBlock,
+			outputTruncated: queried.truncated,
+			outputTotalBytes: queried.totalBytes,
+			outputTotalLines: queried.totalLines,
+			hasOutput: queried.output.length > 0,
+		},
+	};
+}
+
 async function resolveHandoffForCompletion(
 	info: HeadlessCompletionInfo,
 	opts?: {
@@ -2314,51 +2391,13 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				if (actions.length === 0) {
 					// Background-only query path (after first completed poll unregistered active).
 					if (!session && bgSession) {
-						const queried = await queryBackgroundSessionOutput(sessionId, bgSession, ctx.cwd, {
+						return getBackgroundOutputResponse(sessionId, bgSession, ctx.cwd, {
 							outputLines,
 							outputMaxChars,
 							outputOffset,
 							drain,
 							incremental,
-							skipRateLimit: true,
 						});
-						const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
-						const outputBlock = {
-							output: queried.output,
-							truncated: queried.truncated,
-							totalBytes: queried.totalBytes,
-							totalLines: queried.totalLines,
-							hasMore: queried.hasMore,
-						};
-						if (queried.lastResult) {
-							return {
-								content: [
-									{
-										type: "text",
-										text: `Session ${sessionId} ${queried.status} after ${formatDurationMs(queried.runtime)}${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
-									},
-								],
-								details: completedSessionQueryDetails(sessionId, queried.status, queried.runtime, outputBlock, queried.lastResult),
-							};
-						}
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Session ${sessionId} ${queried.status} (${formatDurationMs(queried.runtime)})${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
-								},
-							],
-							details: {
-								sessionId,
-								status: queried.status,
-								runtime: queried.runtime,
-								...outputBlock,
-								outputTruncated: queried.truncated,
-								outputTotalBytes: queried.totalBytes,
-								outputTotalLines: queried.totalLines,
-								hasOutput: queried.output.length > 0,
-							},
-						};
 					}
 
 					const activeSession = session!;
@@ -2367,7 +2406,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					const result = activeSession.getResult();
 
 					if (result) {
-						const { output, truncated, totalBytes, totalLines, hasMore } = await activeSession.getOutput({
+						const outputResult = await activeSession.getOutput({
 							skipRateLimit: true,
 							lines: outputLines,
 							maxChars: outputMaxChars,
@@ -2375,26 +2414,11 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							drain,
 							incremental,
 						});
-						const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
 						// Keep completion on the background entry, then drop active so further
 						// sessionId queries use the background fallback (with full lastResult).
 						persistBackgroundResult(sessionId, result);
 						sessionManager.unregisterActive(sessionId, result.backgrounded === false);
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Session ${sessionId} ${status} after ${formatDurationMs(runtime)}${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
-								},
-							],
-							details: completedSessionQueryDetails(
-								sessionId,
-								status,
-								runtime,
-								{ output, truncated, totalBytes, totalLines, hasMore },
-								result,
-							),
-						};
+						return buildCompletedSessionResponse(sessionId, status, runtime, outputResult, result);
 					}
 
 					const outputResult = await activeSession.getOutput({
@@ -2418,51 +2442,13 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 								// Completion may have raced unregister; fall back to background if present.
 								const fallbackBg = sessionManager.hasBackground(sessionId) ? sessionManager.get(sessionId) : undefined;
 								if (fallbackBg) {
-									const queried = await queryBackgroundSessionOutput(sessionId, fallbackBg, ctx.cwd, {
+									return getBackgroundOutputResponse(sessionId, fallbackBg, ctx.cwd, {
 										outputLines,
 										outputMaxChars,
 										outputOffset,
 										drain,
 										incremental,
-										skipRateLimit: true,
 									});
-									const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
-									const outputBlock = {
-										output: queried.output,
-										truncated: queried.truncated,
-										totalBytes: queried.totalBytes,
-										totalLines: queried.totalLines,
-										hasMore: queried.hasMore,
-									};
-									if (queried.lastResult) {
-										return {
-											content: [
-												{
-													type: "text",
-													text: `Session ${sessionId} ${queried.status} after ${formatDurationMs(queried.runtime)}${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
-												},
-											],
-											details: completedSessionQueryDetails(sessionId, queried.status, queried.runtime, outputBlock, queried.lastResult),
-										};
-									}
-									return {
-										content: [
-											{
-												type: "text",
-												text: `Session ${sessionId} ${queried.status} (${formatDurationMs(queried.runtime)})${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
-											},
-										],
-										details: {
-											sessionId,
-											status: queried.status,
-											runtime: queried.runtime,
-											...outputBlock,
-											outputTruncated: queried.truncated,
-											outputTotalBytes: queried.totalBytes,
-											outputTotalLines: queried.totalLines,
-											hasOutput: queried.output.length > 0,
-										},
-									};
 								}
 								return { content: [{ type: "text", text: `Session ${sessionId} ended` }], details: { sessionId, status: "ended" } };
 							}
@@ -2481,21 +2467,13 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							if (earlyResult) {
 								persistBackgroundResult(sessionId, earlyResult);
 								sessionManager.unregisterActive(sessionId, earlyResult.backgrounded === false);
-								return {
-									content: [
-										{
-											type: "text",
-											text: `Session ${sessionId} ${earlyStatus} after ${formatDurationMs(earlyRuntime)}${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
-										},
-									],
-									details: completedSessionQueryDetails(
-										sessionId,
-										earlyStatus,
-										earlyRuntime,
-										{ output, truncated, totalBytes, totalLines, hasMore },
-										earlyResult,
-									),
-								};
+								return buildCompletedSessionResponse(
+									sessionId,
+									earlyStatus,
+									earlyRuntime,
+									{ output, truncated, totalBytes, totalLines, hasMore },
+									earlyResult,
+								);
 							}
 							return {
 								content: [
@@ -2532,27 +2510,19 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						if (freshResult) {
 							persistBackgroundResult(sessionId, freshResult);
 							sessionManager.unregisterActive(sessionId, freshResult.backgrounded === false);
-							return {
-								content: [
-									{
-										type: "text",
-										text: `Session ${sessionId} ${freshStatus} after ${formatDurationMs(freshRuntime)}${freshOutput.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${freshOutput.output}` : ""}`,
-									},
-								],
-								details: completedSessionQueryDetails(
-									sessionId,
-									freshStatus,
-									freshRuntime,
-									{
-										output: freshOutput.output,
-										truncated: freshOutput.truncated,
-										totalBytes: freshOutput.totalBytes,
-										totalLines: freshOutput.totalLines,
-										hasMore: freshOutput.hasMore,
-									},
-									freshResult,
-								),
-							};
+							return buildCompletedSessionResponse(
+								sessionId,
+								freshStatus,
+								freshRuntime,
+								{
+									output: freshOutput.output,
+									truncated: freshOutput.truncated,
+									totalBytes: freshOutput.totalBytes,
+									totalLines: freshOutput.totalLines,
+									hasMore: freshOutput.hasMore,
+								},
+								freshResult,
+							);
 						}
 						return {
 							content: [
