@@ -8,6 +8,11 @@ export interface BackgroundSession {
 	reason?: string;
 	session: TerminalSession;
 	startedAt: Date;
+	/**
+	 * Completion snapshot retained after active is unregistered (first result poll).
+	 * Lets subsequent sessionId queries return exitCode / handoff / completionOutput.
+	 */
+	lastResult?: ActiveSessionResult;
 }
 
 export type ActiveSessionStatus = "running" | "monitoring" | "user-takeover" | "exited" | "killed" | "backgrounded";
@@ -259,6 +264,20 @@ export class ShellSessionManager {
 
 	getActive(id: string): ActiveSession | undefined {
 		return this.activeSessions.get(id);
+	}
+
+	/**
+	 * Persist a completion result on the background entry without touching timers.
+	 * Used when hands-free/dispatch finalize, and when the first result poll unregisters active.
+	 */
+	setBackgroundResult(id: string, result: ActiveSessionResult): void {
+		const entry = this.sessions.get(id);
+		if (!entry) return;
+		entry.lastResult = result;
+	}
+
+	getBackgroundResult(id: string): ActiveSessionResult | undefined {
+		return this.sessions.get(id)?.lastResult;
 	}
 
 	/**

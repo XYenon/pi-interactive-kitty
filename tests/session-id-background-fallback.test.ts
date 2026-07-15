@@ -185,6 +185,11 @@ async function setupHarness() {
 			take: vi.fn(() => undefined),
 			get: vi.fn((id: string) => bgEntries.get(id)),
 			hasBackground: vi.fn((id: string) => bgEntries.has(id)),
+			setBackgroundResult: vi.fn((id: string, result: any) => {
+				const entry = bgEntries.get(id);
+				if (entry) entry.lastResult = result;
+			}),
+			getBackgroundResult: vi.fn((id: string) => bgEntries.get(id)?.lastResult),
 			getQueryState: vi.fn((id: string) => {
 				let state = queryStates.get(id);
 				if (!state) {
@@ -315,6 +320,9 @@ describe("sessionId background fallback (P-1)", () => {
 		expect(second.content[0]?.text).not.toMatch(/not found/i);
 		expect(second.details.output).toContain("LINE-001");
 		expect(second.details.hasMore).toBe(true);
+		// lastResult should still expose exit metadata after active was dropped.
+		expect(second.details.exitCode).toBe(0);
+		expect(second.details.cancelled).toBe(false);
 
 		const third = await harness.toolDef.execute(
 			"call-3",

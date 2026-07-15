@@ -1177,6 +1177,18 @@ function maybeRestartBackgroundCleanup(sessionId: string): void {
 	}
 }
 
+function persistBackgroundResult(sessionId: string, result: ActiveSessionResult): void {
+	sessionManager.setBackgroundResult(sessionId, result);
+}
+
+function statusFromBackground(bg: BackgroundSession): string {
+	const result = bg.lastResult;
+	if (result?.cancelled) return "killed";
+	if (result?.timedOut) return "exited";
+	if (result || bg.session.exited) return "exited";
+	return "running";
+}
+
 async function queryBackgroundSessionOutput(
 	sessionId: string,
 	bg: BackgroundSession,
@@ -1197,27 +1209,112 @@ async function queryBackgroundSessionOutput(
 	totalBytes: number;
 	totalLines?: number;
 	hasMore?: boolean;
+	lastResult?: ActiveSessionResult;
 }> {
 	const config = loadConfig(ctxCwd);
 	const queryState = sessionManager.getQueryState(sessionId);
-	const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(bg.session, config, queryState, {
-		skipRateLimit: opts.skipRateLimit ?? true,
-		lines: opts.outputLines,
-		maxChars: opts.outputMaxChars,
-		offset: opts.outputOffset,
-		drain: opts.drain,
-		incremental: opts.incremental,
-	});
+	const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(
+		bg.session,
+		config,
+		queryState,
+		{
+			skipRateLimit: opts.skipRateLimit ?? true,
+			lines: opts.outputLines,
+			maxChars: opts.outputMaxChars,
+			offset: opts.outputOffset,
+			drain: opts.drain,
+			incremental: opts.incremental,
+		},
+		// Default tail can reuse the exit-time snapshot; incremental/drain/offset need live/log paths.
+		bg.lastResult?.completionOutput,
+	);
 	maybeRestartBackgroundCleanup(sessionId);
 	return {
-		status: bg.session.exited ? "exited" : "running",
+		status: statusFromBackground(bg),
 		runtime: Date.now() - bg.startedAt.getTime(),
 		output,
 		truncated,
 		totalBytes,
 		totalLines,
 		hasMore,
+		lastResult: bg.lastResult,
 	};
+}
+
+/**
+ * After attach, re-register a lightweight active handle when the kitty session is still
+ * running so sessionId settings/input keep working (main reattach re-opened an overlay).
+ * Always read completion from background.lastResult / live monitor so post-completion
+ * polls stay consistent after rehydrate.
+ */
+function rehydrateActiveFromBackground(sessionId: string, config: InteractiveShellConfig): void {
+	if (sessionManager.getActive(sessionId)) return;
+	if (!sessionManager.hasBackground(sessionId)) return;
+	const bg = sessionManager.get(sessionId);
+	if (!bg || bg.session.exited) return;
+
+	const monitor = coordinator.getMonitor(sessionId);
+	const startTime = bg.startedAt.getTime();
+	const queryState = sessionManager.getQueryState(sessionId);
+	const liveMonitor = () => {
+		const current = coordinator.getMonitor(sessionId);
+		return current && !current.disposed ? current : undefined;
+	};
+
+	sessionManager.registerActive({
+		id: sessionId,
+		command: bg.command,
+		reason: bg.reason,
+		...sessionIoBindings(bg.session),
+		kill: () => {
+			const mon = liveMonitor();
+			if (mon) {
+				mon.cancel();
+				return;
+			}
+			bg.session.kill();
+		},
+		background: () => {},
+		getOutput: (opts) =>
+			getSessionOutput(
+				bg.session,
+				config,
+				queryState,
+				opts,
+				bg.lastResult?.completionOutput ?? liveMonitor()?.getResult()?.completionOutput,
+			),
+		getStatus: () => {
+			if (bg.lastResult?.cancelled) return "killed";
+			if (bg.lastResult || bg.session.exited) return "exited";
+			const monState = coordinator.getMonitorSessionState(sessionId);
+			if (monState?.status === "running") return "monitoring";
+			return "running";
+		},
+		getRuntime: () => Date.now() - startTime,
+		getResult: () => {
+			if (bg.lastResult) return bg.lastResult;
+			const info = liveMonitor()?.getResult();
+			if (!info) return undefined;
+			return {
+				exitCode: info.exitCode,
+				signal: info.signal,
+				timedOut: info.timedOut,
+				cancelled: info.cancelled,
+				completionOutput: info.completionOutput,
+			};
+		},
+		setQuietThreshold: (thresholdMs) => {
+			liveMonitor()?.setQuietThreshold(thresholdMs);
+		},
+		onComplete: (cb) => {
+			const mon = liveMonitor();
+			if (mon) {
+				mon.registerCompleteCallback(cb);
+				return;
+			}
+			bg.session.addExitListener(() => cb());
+		},
+	});
 }
 
 export default function interactiveShellExtension(pi: ExtensionAPI) {
@@ -1506,6 +1603,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							completionOutput: info.completionOutput,
 							...artifacts,
 						};
+						persistBackgroundResult(sessionId, storedResult.current);
 						makeMonitorCompletionCallback(pi, sessionId, startTime, {
 							session,
 							config,
@@ -1570,9 +1668,11 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							completionOutput: info.completionOutput,
 							...artifacts,
 						};
+						persistBackgroundResult(sessionId, storedResult.current);
 						// Keep agent-poll semantics: no triggerTurn completion notification.
 						// Leave active session registered so the agent can query result/handoff;
 						// the first successful poll unregisters (see sessionId query path).
+						// Result stays on background.lastResult for subsequent sessionId queries.
 						scheduleHandsFreeExpiry(sessionId);
 						coordinator.deleteMonitor(sessionId);
 					})();
@@ -1667,8 +1767,9 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						...artifacts,
 					};
 					storedResult.current = full;
+					persistBackgroundResult(sessionId, full);
 					sessionManager.unregisterActive(sessionId, false);
-					clearHandoffContext(sessionId);
+					// Keep handoff context until cleanup/dismiss so late queries can still resolve artifacts.
 					sessionManager.scheduleCleanup(sessionId, 5 * 60 * 1000);
 					resolve(full);
 				})();
@@ -2222,6 +2323,24 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							skipRateLimit: true,
 						});
 						const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
+						const outputBlock = {
+							output: queried.output,
+							truncated: queried.truncated,
+							totalBytes: queried.totalBytes,
+							totalLines: queried.totalLines,
+							hasMore: queried.hasMore,
+						};
+						if (queried.lastResult) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Session ${sessionId} ${queried.status} after ${formatDurationMs(queried.runtime)}${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+									},
+								],
+								details: completedSessionQueryDetails(sessionId, queried.status, queried.runtime, outputBlock, queried.lastResult),
+							};
+						}
 						return {
 							content: [
 								{
@@ -2233,11 +2352,10 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 								sessionId,
 								status: queried.status,
 								runtime: queried.runtime,
-								output: queried.output,
+								...outputBlock,
 								outputTruncated: queried.truncated,
 								outputTotalBytes: queried.totalBytes,
 								outputTotalLines: queried.totalLines,
-								hasMore: queried.hasMore,
 								hasOutput: queried.output.length > 0,
 							},
 						};
@@ -2258,9 +2376,10 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							incremental,
 						});
 						const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
-						// Drop active after first result poll; further sessionId queries use background fallback.
+						// Keep completion on the background entry, then drop active so further
+						// sessionId queries use the background fallback (with full lastResult).
+						persistBackgroundResult(sessionId, result);
 						sessionManager.unregisterActive(sessionId, result.backgrounded === false);
-						clearHandoffContext(sessionId);
 						return {
 							content: [
 								{
@@ -2308,6 +2427,24 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 										skipRateLimit: true,
 									});
 									const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
+									const outputBlock = {
+										output: queried.output,
+										truncated: queried.truncated,
+										totalBytes: queried.totalBytes,
+										totalLines: queried.totalLines,
+										hasMore: queried.hasMore,
+									};
+									if (queried.lastResult) {
+										return {
+											content: [
+												{
+													type: "text",
+													text: `Session ${sessionId} ${queried.status} after ${formatDurationMs(queried.runtime)}${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+												},
+											],
+											details: completedSessionQueryDetails(sessionId, queried.status, queried.runtime, outputBlock, queried.lastResult),
+										};
+									}
 									return {
 										content: [
 											{
@@ -2319,11 +2456,10 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 											sessionId,
 											status: queried.status,
 											runtime: queried.runtime,
-											output: queried.output,
+											...outputBlock,
 											outputTruncated: queried.truncated,
 											outputTotalBytes: queried.totalBytes,
 											outputTotalLines: queried.totalLines,
-											hasMore: queried.hasMore,
 											hasOutput: queried.output.length > 0,
 										},
 									};
@@ -2343,8 +2479,8 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							const earlyRuntime = earlySession.getRuntime();
 							const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
 							if (earlyResult) {
+								persistBackgroundResult(sessionId, earlyResult);
 								sessionManager.unregisterActive(sessionId, earlyResult.backgrounded === false);
-								clearHandoffContext(sessionId);
 								return {
 									content: [
 										{
@@ -2394,8 +2530,8 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						const freshRuntime = activeSession.getRuntime();
 						const freshResult = activeSession.getResult();
 						if (freshResult) {
+							persistBackgroundResult(sessionId, freshResult);
 							sessionManager.unregisterActive(sessionId, freshResult.backgrounded === false);
-							clearHandoffContext(sessionId);
 							return {
 								content: [
 									{
@@ -2505,19 +2641,46 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				// Reuse manager-owned query state — do not createSessionQueryState() here.
 				// A fresh state resets the incremental cursor so attach pagination restarts at 0.
 				const queryState = sessionManager.getQueryState(attach);
-				const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(bgSession.session, config, queryState, {
-					skipRateLimit: true,
-					lines: outputLines,
-					maxChars: outputMaxChars,
-					offset: outputOffset,
-					drain,
-					incremental,
-				});
+				const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(
+					bgSession.session,
+					config,
+					queryState,
+					{
+						skipRateLimit: true,
+						lines: outputLines,
+						maxChars: outputMaxChars,
+						offset: outputOffset,
+						drain,
+						incremental,
+					},
+					bgSession.lastResult?.completionOutput,
+				);
+				// Re-register active while the tab is still running so settings/input via
+				// sessionId work after attach (main reattach re-opened an overlay handle).
+				if (!bgSession.session.exited) {
+					rehydrateActiveFromBackground(attach, config);
+				}
 				if (!monitor || monitor.disposed) {
 					sessionManager.restartAutoCleanup(attach);
 				}
-				const status = bgSession.session.exited ? "exited" : "running";
+				const status = statusFromBackground(bgSession);
 				const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
+				const runtime = Date.now() - bgSession.startedAt.getTime();
+				const outputBlock = { output, truncated, totalBytes, totalLines, hasMore };
+				if (bgSession.lastResult) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Focused kitty session ${attach} (${status})${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+							},
+						],
+						details: {
+							...completedSessionQueryDetails(attach, status, runtime, outputBlock, bgSession.lastResult),
+							focused: true,
+						},
+					};
+				}
 				return {
 					content: [
 						{
@@ -2528,11 +2691,13 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					details: {
 						sessionId: attach,
 						status,
+						runtime,
 						output,
 						outputTruncated: truncated,
 						outputTotalBytes: totalBytes,
 						outputTotalLines: totalLines,
 						hasMore,
+						focused: true,
 					},
 				};
 			}
