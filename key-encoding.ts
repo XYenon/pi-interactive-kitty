@@ -95,9 +95,23 @@ function altKey(char: string): string {
 
 // Keys that support xterm modifier encoding (CSI sequences)
 const MODIFIABLE_KEYS = new Set([
-	"up", "down", "left", "right", "home", "end",
-	"pageup", "pgup", "ppage", "pagedown", "pgdn", "npage",
-	"insert", "ic", "delete", "del", "dc",
+	"up",
+	"down",
+	"left",
+	"right",
+	"home",
+	"end",
+	"pageup",
+	"pgup",
+	"ppage",
+	"pagedown",
+	"pgdn",
+	"npage",
+	"insert",
+	"ic",
+	"delete",
+	"del",
+	"dc",
 ]);
 
 // Calculate xterm modifier code: 1 + (shift?1:0) + (alt?2:0) + (ctrl?4:0)
@@ -138,26 +152,12 @@ function encodePaste(text: string, bracketed = true): string {
 	return `${BRACKETED_PASTE_START}${text}${BRACKETED_PASTE_END}`;
 }
 
-/** Parse a key token and return the escape sequence */
-function encodeKeyToken(token: string): string {
-	const normalized = token.trim().toLowerCase();
-	if (!normalized) return "";
-
-	// Check for direct match in named keys
-	if (NAMED_KEYS[normalized]) {
-		return NAMED_KEYS[normalized];
-	}
-
-	// Check for ctrl+key
-	if (CTRL_KEYS[normalized]) {
-		return CTRL_KEYS[normalized];
-	}
-
-	// Parse modifier prefixes: ctrl+alt+shift+key, c-m-s-key, etc.
-	let rest = normalized;
-	let ctrl = false, alt = false, shift = false;
-
-	// Support both "ctrl+alt+x" and "c-m-x" syntax
+/** Strip leading modifier prefixes (ctrl+/alt+/shift+ and c-/m-/s- forms). */
+function stripKeyModifiers(token: string): { rest: string; ctrl: boolean; alt: boolean; shift: boolean } {
+	let rest = token;
+	let ctrl = false;
+	let alt = false;
+	let shift = false;
 	while (rest.length > 2) {
 		if (rest.startsWith("ctrl+") || rest.startsWith("ctrl-")) {
 			ctrl = true;
@@ -181,13 +181,27 @@ function encodeKeyToken(token: string): string {
 			break;
 		}
 	}
+	return { rest, ctrl, alt, shift };
+}
 
-	// Handle shift+tab specially
+/** Parse a key token and return the escape sequence */
+function encodeKeyToken(token: string): string {
+	const normalized = token.trim().toLowerCase();
+	if (!normalized) return "";
+
+	if (NAMED_KEYS[normalized]) {
+		return NAMED_KEYS[normalized];
+	}
+	if (CTRL_KEYS[normalized]) {
+		return CTRL_KEYS[normalized];
+	}
+
+	const { rest, ctrl, alt, shift } = stripKeyModifiers(normalized);
+
 	if (shift && rest === "tab") {
 		return "\x1b[Z";
 	}
 
-	// Check if base key is a named key that supports modifiers
 	const baseSeq = NAMED_KEYS[rest];
 	if (baseSeq && MODIFIABLE_KEYS.has(rest) && (ctrl || alt || shift)) {
 		const mod = xtermModifier(shift, alt, ctrl);
@@ -197,7 +211,6 @@ function encodeKeyToken(token: string): string {
 		}
 	}
 
-	// For single character with modifiers
 	if (rest.length === 1) {
 		let char = rest;
 		if (shift && /[a-z]/.test(char)) {
@@ -213,18 +226,33 @@ function encodeKeyToken(token: string): string {
 		return char;
 	}
 
-	// Named key with alt modifier
 	if (baseSeq && alt) {
 		return `\x1b${baseSeq}`;
 	}
-
-	// Return base sequence if found
 	if (baseSeq) {
 		return baseSeq;
 	}
-
-	// Unknown key, return as literal
 	return token;
+}
+
+/**
+ * Whether a key token is a named/modified key (e.g. ctrl+c, enter, up, f1, shift+tab)
+ * rather than a literal string to type. Used to decide send-key vs send-text.
+ *
+ * Pitfall: kitty's send-key silently drops non-keysyms (single chars under some
+ * keyboard modes *and* multi-char literals like "abc" / "++" / "你好") while always
+ * reporting success. Only route recognized keysyms/modifiers through send-key;
+ * everything else must go through send-text. A length===1 check alone is not enough.
+ */
+export function isNamedKey(token: string): boolean {
+	const normalized = token.trim().toLowerCase();
+	if (!normalized) return false;
+	if (NAMED_KEYS[normalized] || CTRL_KEYS[normalized]) return true;
+	const { rest, ctrl, alt, shift } = stripKeyModifiers(normalized);
+	if (!rest) return false;
+	if (NAMED_KEYS[rest]) return true;
+	if ((ctrl || alt || shift) && rest.length === 1) return true;
+	return false;
 }
 
 /** Translate input specification to terminal escape sequences */

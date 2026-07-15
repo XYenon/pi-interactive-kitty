@@ -14,7 +14,10 @@ export function trimRawOutput(rawOutput: string, lastStreamPosition: number): { 
 	};
 }
 
-export function sliceLogOutput(text: string, options: { offset?: number; limit?: number; stripAnsi?: boolean } = {}): {
+export function sliceLogOutput(
+	text: string,
+	options: { offset?: number; limit?: number; stripAnsi?: boolean } = {},
+): {
 	slice: string;
 	totalLines: number;
 	totalChars: number;
@@ -30,7 +33,10 @@ export function sliceLogOutput(text: string, options: { offset?: number; limit?:
 
 	const normalized = source.replace(/\r\n/g, "\n");
 	const lines = normalized.split("\n");
-	if (lines.length > 0 && lines[lines.length - 1] === "") {
+	// Pitfall: kitty get-text extent:all returns a fixed-size buffer padded with empty
+	// rows below the cursor. Without trimming, "last N lines" / log slices for short
+	// commands are all blanks. Drop only *trailing* blank padding; keep internal blanks.
+	while (lines.length > 0 && lines[lines.length - 1]!.trim().length === 0) {
 		lines.pop();
 	}
 
@@ -46,9 +52,8 @@ export function sliceLogOutput(text: string, options: { offset?: number; limit?:
 		start = 0;
 	}
 
-	const end = typeof options.limit === "number" && Number.isFinite(options.limit)
-		? start + Math.max(0, Math.floor(options.limit))
-		: undefined;
+	const end =
+		typeof options.limit === "number" && Number.isFinite(options.limit) ? start + Math.max(0, Math.floor(options.limit)) : undefined;
 	const selectedLines = lines.slice(start, end);
 	return {
 		slice: selectedLines.join("\n"),

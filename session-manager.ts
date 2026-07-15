@@ -1,11 +1,12 @@
-import { PtyTerminalSession } from "./pty-session.js";
+import { createSessionQueryState, type SessionQueryState } from "./session-query.js";
+import type { TerminalSession } from "./terminal-session.js";
 
 export interface BackgroundSession {
 	id: string;
 	name: string;
 	command: string;
 	reason?: string;
-	session: PtyTerminalSession;
+	session: TerminalSession;
 	startedAt: Date;
 }
 
@@ -18,6 +19,22 @@ export interface ActiveSessionResult {
 	backgroundId?: string;
 	cancelled?: boolean;
 	timedOut?: boolean;
+	completionOutput?: {
+		lines: string[];
+		totalLines: number;
+		truncated: boolean;
+	};
+	handoffPreview?: {
+		type: "tail";
+		when: "exit" | "detach" | "kill" | "timeout";
+		lines: string[];
+	};
+	handoff?: {
+		type: "snapshot";
+		when: "exit" | "detach" | "kill" | "timeout";
+		transcriptPath: string;
+		linesWritten: number;
+	};
 }
 
 export interface OutputResult {
@@ -46,9 +63,15 @@ export interface ActiveSession {
 	command: string;
 	reason?: string;
 	write: (data: string) => void;
+	sendKeys?: (keys: string[]) => void;
+	paste?: (text: string) => void;
+	writeAsync?: (data: string) => Promise<void>;
+	sendKeysAsync?: (keys: string[]) => Promise<void>;
+	pasteAsync?: (text: string) => Promise<void>;
+	focus?: () => Promise<void> | void;
 	kill: () => void;
 	background: () => void;
-	getOutput: (options?: OutputOptions | boolean) => OutputResult;
+	getOutput: (options?: OutputOptions | boolean) => Promise<OutputResult>;
 	getStatus: () => ActiveSessionStatus;
 	getRuntime: () => number;
 	getResult: () => ActiveSessionResult | undefined;
@@ -59,17 +82,71 @@ export interface ActiveSession {
 
 // Human-readable session slug generation
 const SLUG_ADJECTIVES = [
-	"amber", "brisk", "calm", "clear", "cool", "crisp", "dawn", "ember",
-	"fast", "fresh", "gentle", "keen", "kind", "lucky", "mellow", "mild",
-	"neat", "nimble", "nova", "quick", "quiet", "rapid", "sharp", "swift",
-	"tender", "tidy", "vivid", "warm", "wild", "young",
+	"amber",
+	"brisk",
+	"calm",
+	"clear",
+	"cool",
+	"crisp",
+	"dawn",
+	"ember",
+	"fast",
+	"fresh",
+	"gentle",
+	"keen",
+	"kind",
+	"lucky",
+	"mellow",
+	"mild",
+	"neat",
+	"nimble",
+	"nova",
+	"quick",
+	"quiet",
+	"rapid",
+	"sharp",
+	"swift",
+	"tender",
+	"tidy",
+	"vivid",
+	"warm",
+	"wild",
+	"young",
 ];
 
 const SLUG_NOUNS = [
-	"atlas", "bloom", "breeze", "cedar", "cloud", "comet", "coral", "cove",
-	"crest", "delta", "dune", "ember", "falcon", "fjord", "glade", "haven",
-	"kelp", "lagoon", "meadow", "mist", "nexus", "orbit", "pine", "reef",
-	"ridge", "river", "sage", "shell", "shore", "summit", "trail", "zephyr",
+	"atlas",
+	"bloom",
+	"breeze",
+	"cedar",
+	"cloud",
+	"comet",
+	"coral",
+	"cove",
+	"crest",
+	"delta",
+	"dune",
+	"ember",
+	"falcon",
+	"fjord",
+	"glade",
+	"haven",
+	"kelp",
+	"lagoon",
+	"meadow",
+	"mist",
+	"nexus",
+	"orbit",
+	"pine",
+	"reef",
+	"ridge",
+	"river",
+	"sage",
+	"shell",
+	"shore",
+	"summit",
+	"trail",
+	"zephyr",
 ];
 
 function randomChoice<T>(arr: T[]): T {
@@ -79,12 +156,22 @@ function randomChoice<T>(arr: T[]): T {
 // Track used IDs to avoid collisions
 const usedIds = new Set<string>();
 
+/**
+ * True if `id` is reserved: either explicitly tracked in `usedIds` (running
+ * active sessions retain their id until fully released), or still present as
+ * a background entry (kept for attach/history for up to 5 minutes after kill).
+ * Prevents id reuse from overwriting an existing background entry.
+ */
+function isSessionIdReserved(id: string): boolean {
+	return usedIds.has(id) || sessionManager.hasBackground(id);
+}
+
 export function generateSessionId(name?: string): string {
 	// If a custom name is provided, use simple counter approach
 	if (name) {
 		let counter = 1;
 		let id = name;
-		while (usedIds.has(id)) {
+		while (isSessionIdReserved(id)) {
 			counter++;
 			id = `${name}-${counter}`;
 		}
@@ -98,7 +185,7 @@ export function generateSessionId(name?: string): string {
 		const noun = randomChoice(SLUG_NOUNS);
 		const base = `${adj}-${noun}`;
 
-		if (!usedIds.has(base)) {
+		if (!isSessionIdReserved(base)) {
 			usedIds.add(base);
 			return base;
 		}
@@ -106,7 +193,7 @@ export function generateSessionId(name?: string): string {
 		// Try with suffix
 		for (let i = 2; i <= 9; i++) {
 			const candidate = `${base}-${i}`;
-			if (!usedIds.has(candidate)) {
+			if (!isSessionIdReserved(candidate)) {
 				usedIds.add(candidate);
 				return candidate;
 			}
@@ -137,11 +224,14 @@ export class ShellSessionManager {
 	private exitWatchers = new Map<string, NodeJS.Timeout>();
 	private cleanupTimers = new Map<string, NodeJS.Timeout>();
 	private activeSessions = new Map<string, ActiveSession>();
+	private queryStates = new Map<string, SessionQueryState>();
 	private changeListeners = new Set<() => void>();
 
 	onChange(listener: () => void): () => void {
 		this.changeListeners.add(listener);
-		return () => { this.changeListeners.delete(listener); };
+		return () => {
+			this.changeListeners.delete(listener);
+		};
 	}
 
 	private notifyChange(): void {
@@ -171,6 +261,21 @@ export class ShellSessionManager {
 		return this.activeSessions.get(id);
 	}
 
+	/**
+	 * Per-session query state (incremental cursor / drain position / rate-limit clock).
+	 * Must outlive individual attach tool calls: a fresh SessionQueryState on every
+	 * attach resets the incremental cursor to 0, so page 2 returns the same lines as page 1.
+	 * Cleaned up when the background entry is take()/remove()'d.
+	 */
+	getQueryState(id: string): SessionQueryState {
+		let state = this.queryStates.get(id);
+		if (!state) {
+			state = createSessionQueryState();
+			this.queryStates.set(id, state);
+		}
+		return state;
+	}
+
 	writeToActive(id: string, data: string): boolean {
 		const session = this.activeSessions.get(id);
 		if (!session) return false;
@@ -192,7 +297,13 @@ export class ShellSessionManager {
 		return true;
 	}
 
-	add(command: string, session: PtyTerminalSession, name?: string, reason?: string, options?: { id?: string; noAutoCleanup?: boolean; startedAt?: Date }): string {
+	add(
+		command: string,
+		session: TerminalSession,
+		name?: string,
+		reason?: string,
+		options?: { id?: string; noAutoCleanup?: boolean; startedAt?: Date },
+	): string {
 		const id = options?.id ?? generateSessionId(name);
 		if (options?.id) usedIds.add(id);
 		const entry: BackgroundSession = {
@@ -216,27 +327,14 @@ export class ShellSessionManager {
 	private storeBackgroundEntry(entry: BackgroundSession, noAutoCleanup: boolean): void {
 		this.sessions.set(entry.id, entry);
 		entry.session.setEventHandlers({});
-
 		if (!noAutoCleanup) {
-			const checkExit = setInterval(() => {
-				if (entry.session.exited) {
-					clearInterval(checkExit);
-					this.exitWatchers.delete(entry.id);
-					this.notifyChange();
-					const cleanupTimer = setTimeout(() => {
-						this.cleanupTimers.delete(entry.id);
-						this.remove(entry.id);
-					}, 30000);
-					this.cleanupTimers.set(entry.id, cleanupTimer);
-				}
-			}, 1000);
-			this.exitWatchers.set(entry.id, checkExit);
+			this.startExitWatcher(entry);
 		}
-
 		this.notifyChange();
 	}
 
-	take(id: string): BackgroundSession | undefined {
+	/** Clear exit-watcher + deferred-cleanup timers for a background session. */
+	private clearSessionTimers(id: string): void {
 		const watcher = this.exitWatchers.get(id);
 		if (watcher) {
 			clearInterval(watcher);
@@ -247,27 +345,33 @@ export class ShellSessionManager {
 			clearTimeout(cleanupTimer);
 			this.cleanupTimers.delete(id);
 		}
+	}
+
+	private startExitWatcher(entry: BackgroundSession): void {
+		const checkExit = setInterval(() => {
+			if (entry.session.exited) {
+				clearInterval(checkExit);
+				this.exitWatchers.delete(entry.id);
+				this.notifyChange();
+				this.scheduleCleanup(entry.id);
+			}
+		}, 1000);
+		this.exitWatchers.set(entry.id, checkExit);
+	}
+
+	take(id: string): BackgroundSession | undefined {
+		this.clearSessionTimers(id);
 		const session = this.sessions.get(id);
-		if (session) {
-			this.sessions.delete(id);
-			this.notifyChange();
-			return session;
-		}
-		return undefined;
+		if (!session) return undefined;
+		this.sessions.delete(id);
+		this.queryStates.delete(id);
+		this.notifyChange();
+		return session;
 	}
 
 	get(id: string): BackgroundSession | undefined {
-		// Suspend all auto-cleanup while session is being actively used
-		const watcher = this.exitWatchers.get(id);
-		if (watcher) {
-			clearInterval(watcher);
-			this.exitWatchers.delete(id);
-		}
-		const cleanupTimer = this.cleanupTimers.get(id);
-		if (cleanupTimer) {
-			clearTimeout(cleanupTimer);
-			this.cleanupTimers.delete(id);
-		}
+		// Suspend auto-cleanup while the session is being actively used.
+		this.clearSessionTimers(id);
 		return this.sessions.get(id);
 	}
 
@@ -279,15 +383,7 @@ export class ShellSessionManager {
 			this.scheduleCleanup(id);
 			return;
 		}
-		const checkExit = setInterval(() => {
-			if (entry.session.exited) {
-				clearInterval(checkExit);
-				this.exitWatchers.delete(id);
-				this.notifyChange();
-				this.scheduleCleanup(id);
-			}
-		}, 1000);
-		this.exitWatchers.set(id, checkExit);
+		this.startExitWatcher(entry);
 	}
 
 	scheduleCleanup(id: string, delayMs = 30000): void {
@@ -300,29 +396,23 @@ export class ShellSessionManager {
 	}
 
 	remove(id: string): void {
-		const watcher = this.exitWatchers.get(id);
-		if (watcher) {
-			clearInterval(watcher);
-			this.exitWatchers.delete(id);
-		}
-
-		const cleanupTimer = this.cleanupTimers.get(id);
-		if (cleanupTimer) {
-			clearTimeout(cleanupTimer);
-			this.cleanupTimers.delete(id);
-		}
-
+		this.clearSessionTimers(id);
 		const session = this.sessions.get(id);
-		if (session) {
-			session.session.dispose();
-			this.sessions.delete(id);
-			releaseSessionId(id);
-			this.notifyChange();
-		}
+		if (!session) return;
+		session.session.dispose();
+		this.sessions.delete(id);
+		this.queryStates.delete(id);
+		releaseSessionId(id);
+		this.notifyChange();
 	}
 
 	list(): BackgroundSession[] {
 		return Array.from(this.sessions.values());
+	}
+
+	/** True if a background entry for `id` still exists (kept until scheduled cleanup runs). */
+	hasBackground(id: string): boolean {
+		return this.sessions.has(id);
 	}
 
 	killAll(): void {

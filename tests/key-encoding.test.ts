@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { translateInput } from "../key-encoding.js";
+import { isNamedKey, translateInput } from "../key-encoding.js";
 
 describe("translateInput", () => {
 	it("encodes named keys and modifiers", () => {
@@ -7,15 +7,35 @@ describe("translateInput", () => {
 	});
 
 	it("emits paste before trailing keys so pasted input can be submitted afterward", () => {
-		expect(translateInput({
-			text: "hi",
-			keys: ["enter"],
-			hex: ["0x21"],
-			paste: "body",
-		})).toBe("!hi\x1b[200~body\x1b[201~\r");
+		expect(
+			translateInput({
+				text: "hi",
+				keys: ["enter"],
+				hex: ["0x21"],
+				paste: "body",
+			}),
+		).toBe("!hi\x1b[200~body\x1b[201~\r");
 	});
 
 	it("supports xterm modifier encoding for CSI keys", () => {
 		expect(translateInput({ keys: ["ctrl+alt+delete", "s-up"] })).toBe("\x1b[3;7~\x1b[1;2A");
+	});
+});
+
+describe("isNamedKey", () => {
+	it("recognizes named keys and modifiers, rejects literal strings", () => {
+		expect(isNamedKey("enter")).toBe(true);
+		expect(isNamedKey("up")).toBe(true);
+		expect(isNamedKey("f1")).toBe(true);
+		expect(isNamedKey("ctrl+c")).toBe(true);
+		expect(isNamedKey("alt+k")).toBe(true);
+		expect(isNamedKey("shift+tab")).toBe(true);
+		expect(isNamedKey("kp+")).toBe(true);
+		// literal strings -> send-text, not send-key
+		expect(isNamedKey("+")).toBe(false);
+		expect(isNamedKey("q")).toBe(false);
+		expect(isNamedKey("abc")).toBe(false);
+		expect(isNamedKey("++")).toBe(false);
+		expect(isNamedKey("你好")).toBe(false);
 	});
 });
