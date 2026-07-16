@@ -57,6 +57,22 @@ describe("computeSnapshotDelta", () => {
 	});
 });
 
+describe("conventionalSignalExitCode", () => {
+	it("uses 128 + signal number for conventional shell statuses", async () => {
+		vi.resetModules();
+		vi.doMock("@mariozechner/pi-coding-agent", () => ({
+			getAgentDir: () => "/tmp/pi-agent-kitty-session-test",
+		}));
+		const { conventionalSignalExitCode } = await import("../kitty-session.js");
+		expect(conventionalSignalExitCode("SIGINT")).toBe(130);
+		expect(conventionalSignalExitCode("SIGTERM")).toBe(143);
+		expect(conventionalSignalExitCode("SIGKILL")).toBe(137);
+		expect(conventionalSignalExitCode("SIGHUP")).toBe(129);
+		expect(conventionalSignalExitCode("unknown")).toBeUndefined();
+		vi.doUnmock("@mariozechner/pi-coding-agent");
+	});
+});
+
 describe("sessionCacheDirName / capLinesByMaxChars", () => {
 	it("keeps distinct session ids in distinct cache dirs even when sanitized prefixes collide", async () => {
 		vi.resetModules();
@@ -844,6 +860,113 @@ describe("KittyTerminalSession poll transient failures", () => {
 		session.addExitListener(exitFired);
 		expect(exitFired).toHaveBeenCalledTimes(1);
 		expect(exitFired).toHaveBeenCalledWith(0, undefined);
+	});
+
+	it("addDataListener replays buffered stream output for late subscribers", async () => {
+		const sessionId = `data-replay-${Math.random().toString(36).slice(2)}`;
+		// First snapshot is ingested during launch poll; late listener must still see it.
+		const getText = vi.fn().mockResolvedValue("FAIL: build broke\n");
+		const ls = mockLsWithManagedWindow();
+
+		vi.doMock("@mariozechner/pi-coding-agent", () => ({
+			getAgentDir: () => "/tmp/pi-agent-kitty-session-test",
+		}));
+		vi.doMock("../kitty-client.js", async () => {
+			const actual = await vi.importActual<typeof import("../kitty-client.js")>("../kitty-client.js");
+			return {
+				...actual,
+				KittyClient: class MockKittyClient {
+					loadConfig = vi.fn().mockResolvedValue(undefined);
+					launch = vi.fn().mockResolvedValue(42);
+					getText = getText;
+					ls = ls;
+					focusWindow = vi.fn().mockResolvedValue(undefined);
+					focusTabForWindow = vi.fn().mockResolvedValue(undefined);
+					closeWindow = vi.fn().mockResolvedValue(undefined);
+					sendText = vi.fn();
+					sendKeys = vi.fn();
+					signalChild = vi.fn();
+				},
+			};
+		});
+
+		const { KittyTerminalSession } = await import("../kitty-session.js");
+		const session = new KittyTerminalSession({ command: "echo FAIL", id: sessionId }, {
+			scrollbackLines: 5000,
+			kitty: {
+				version: [0, 47, 4] as [number, number, number],
+				responseTimeoutMs: 5000,
+				connectTimeoutMs: 5000,
+				pollIntervalMs: 500,
+				killGraceMs: 1000,
+				osWindowTitle: "test",
+				tabTitlePrefix: "pi-shell",
+				focusNewSessions: false,
+			},
+		} as any);
+		await session.ready;
+		// Drain the initial poll started inside launch.
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const late = vi.fn();
+		session.addDataListener(late);
+		expect(late).toHaveBeenCalled();
+		expect(String(late.mock.calls[0]?.[0])).toContain("FAIL: build broke");
+		session.dispose();
+	});
+
+	it("runner script encodes conventional 128+n signal exit codes", async () => {
+		const sessionId = `runner-signal-${Math.random().toString(36).slice(2)}`;
+		vi.doMock("@mariozechner/pi-coding-agent", () => ({
+			getAgentDir: () => "/tmp/pi-agent-kitty-session-test",
+		}));
+		vi.doMock("../kitty-client.js", async () => {
+			const actual = await vi.importActual<typeof import("../kitty-client.js")>("../kitty-client.js");
+			return {
+				...actual,
+				KittyClient: class MockKittyClient {
+					loadConfig = vi.fn().mockResolvedValue(undefined);
+					launch = vi.fn().mockResolvedValue(42);
+					getText = vi.fn().mockResolvedValue("");
+					ls = mockLsWithManagedWindow();
+					focusWindow = vi.fn().mockResolvedValue(undefined);
+					focusTabForWindow = vi.fn().mockResolvedValue(undefined);
+					closeWindow = vi.fn().mockResolvedValue(undefined);
+					sendText = vi.fn();
+					sendKeys = vi.fn();
+					signalChild = vi.fn();
+				},
+			};
+		});
+
+		const { readFileSync } = await import("node:fs");
+		const { KittyTerminalSession, sessionCacheDirName } = await import("../kitty-session.js");
+		const session = new KittyTerminalSession({ command: "sleep 1", id: sessionId }, {
+			scrollbackLines: 5000,
+			kitty: {
+				version: [0, 47, 4] as [number, number, number],
+				responseTimeoutMs: 5000,
+				connectTimeoutMs: 5000,
+				pollIntervalMs: 500,
+				killGraceMs: 1000,
+				osWindowTitle: "test",
+				tabTitlePrefix: "pi-shell",
+				focusNewSessions: false,
+			},
+		} as any);
+		const runner = readFileSync(
+			`/tmp/pi-agent-kitty-session-test/cache/interactive-kitty/kitty/${sessionCacheDirName(sessionId)}/runner.mjs`,
+			"utf8",
+		);
+		expect(runner).toContain("128 +");
+		expect(runner).toMatch(/SIGINT:\s*2/);
+		expect(runner).toMatch(/SIGTERM:\s*15/);
+		expect(runner).toMatch(/SIGKILL:\s*9/);
+		// Must not collapse every signal to bare 128.
+		expect(runner).not.toMatch(/code \?\? \(signal \? 128 : 1\)/);
+		session.dispose();
 	});
 
 	it("kill() preserves the real exit code when the runner writes exit-code.txt within killGraceMs", async () => {

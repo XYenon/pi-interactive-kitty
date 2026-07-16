@@ -158,6 +158,17 @@ export class KittyTerminalSession implements TerminalSession {
 
 	addDataListener(cb: (data: string) => void): () => void {
 		this.additionalDataListeners.push(cb);
+		// Replay buffered stream so late subscribers still see output emitted during
+		// launch (e.g. HeadlessDispatchMonitor registered only after `await session.ready`).
+		// Without this, fast commands like `echo FAIL` can exit before a stream monitor
+		// is attached and never fire their triggers.
+		if (this.rawOutput) {
+			try {
+				cb(this.rawOutput);
+			} catch (error) {
+				console.error("interactive-shell: data listener replay error:", error);
+			}
+		}
 		return () => {
 			const idx = this.additionalDataListeners.indexOf(cb);
 			if (idx >= 0) this.additionalDataListeners.splice(idx, 1);
@@ -803,7 +814,9 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 }
 
 child.on("exit", (code, signal) => {
-  const exitCode = code ?? (signal ? 128 : 1);
+  // Conventional shell status: 128 + signal number (SIGINT=130, SIGTERM=143, SIGKILL=137).
+  const SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15 };
+  const exitCode = code ?? (signal ? 128 + (SIGNAL_NUMBERS[signal] ?? 0) : 1);
   // Format: "<code>" or "<code> <signalName>" — session poller parses both.
   try { writeFileSync(${JSON.stringify(exitFile)}, signal ? (exitCode + " " + signal) : String(exitCode)); } catch {}
   console.log("");
@@ -820,6 +833,12 @@ const SIGNAL_NUMBERS: Record<string, number> = {
 	SIGKILL: 9,
 	SIGTERM: 15,
 };
+
+/** Conventional shell exit status for a POSIX signal name (`128 + n`). */
+export function conventionalSignalExitCode(signal: string): number | undefined {
+	const n = SIGNAL_NUMBERS[signal.toUpperCase()];
+	return n !== undefined ? 128 + n : undefined;
+}
 
 function parseExitSignal(token: string): number | undefined {
 	const asNumber = Number(token);
