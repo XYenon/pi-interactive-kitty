@@ -884,6 +884,82 @@ describe("KittyTerminalSession poll transient failures", () => {
 		expect(exitFired).toHaveBeenCalledWith(0, undefined);
 	});
 
+	it("live getTailLines before first poll ingests into stream for drain/listeners", async () => {
+		const sessionId = `live-ingest-${Math.random().toString(36).slice(2)}`;
+		// Slow first poll so a status read can win the race and seed previousSnapshot.
+		let releasePoll: (() => void) | undefined;
+		const pollGate = new Promise<void>((resolve) => {
+			releasePoll = resolve;
+		});
+		let getTextCalls = 0;
+		const getText = vi.fn(async () => {
+			getTextCalls += 1;
+			if (getTextCalls === 1) {
+				// launch's initial poll — hold it so ready can complete without stream ingest.
+				await pollGate;
+				return "FAIL: too late for poll\n";
+			}
+			// live getTailLines / later polls
+			return "FAIL: seen via live read\n";
+		});
+		const ls = mockLsWithManagedWindow();
+
+		vi.doMock("@mariozechner/pi-coding-agent", () => ({
+			getAgentDir: () => "/tmp/pi-agent-kitty-session-test",
+		}));
+		vi.doMock("../kitty-client.js", async () => {
+			const actual = await vi.importActual<typeof import("../kitty-client.js")>("../kitty-client.js");
+			return {
+				...actual,
+				KittyClient: class MockKittyClient {
+					loadConfig = vi.fn().mockResolvedValue(undefined);
+					launch = vi.fn().mockResolvedValue(42);
+					getText = getText;
+					ls = ls;
+					focusWindow = vi.fn().mockResolvedValue(undefined);
+					focusTabForWindow = vi.fn().mockResolvedValue(undefined);
+					closeWindow = vi.fn().mockResolvedValue(undefined);
+					sendText = vi.fn();
+					sendKeys = vi.fn();
+					signalChild = vi.fn();
+				},
+			};
+		});
+
+		const { KittyTerminalSession } = await import("../kitty-session.js");
+		const session = new KittyTerminalSession({ command: "echo FAIL", id: sessionId }, {
+			scrollbackLines: 5000,
+			kitty: {
+				version: [0, 47, 4] as [number, number, number],
+				responseTimeoutMs: 5000,
+				connectTimeoutMs: 5000,
+				// Long interval so only the held launch poll is in flight.
+				pollIntervalMs: 60_000,
+				killGraceMs: 1000,
+				osWindowTitle: "test",
+				tabTitlePrefix: "pi-shell",
+				focusNewSessions: false,
+			},
+		} as any);
+		await session.ready;
+
+		const listener = vi.fn();
+		session.addDataListener(listener);
+		// Live status read before the first poll completes — must ingest, not only seed baseline.
+		const tail = await session.getTailLines({ lines: 10, ansi: false });
+		expect(tail.lines.join("\n")).toContain("FAIL: seen via live read");
+		expect(listener).toHaveBeenCalled();
+		expect(String(listener.mock.calls.map((c) => c[0]).join(""))).toContain("FAIL: seen via live read");
+		// Drain must also see the stream content (not empty after a stolen baseline).
+		const drained = session.getRawStream({ sinceLast: false, stripAnsi: true });
+		expect(drained).toContain("FAIL: seen via live read");
+
+		releasePoll?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		session.dispose();
+	});
+
 	it("addDataListener replays buffered stream output for late subscribers", async () => {
 		const sessionId = `data-replay-${Math.random().toString(36).slice(2)}`;
 		// First snapshot is ingested during launch poll; late listener must still see it.

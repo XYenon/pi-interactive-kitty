@@ -63,7 +63,10 @@ export class HeadlessDispatchMonitor {
 	 * (or for killWaitTimer) before finalizing so captureOutput sees post-SIGTERM cleanup.
 	 */
 	private forcedCompletion: { cancelled?: boolean; timedOut?: boolean } | null = null;
+	/** True once completion has started (flush may still be in progress before dispose). */
+	private completionStarted = false;
 	private pollInFlight = false;
+	private pollIdleWaiters: Array<() => void> = [];
 	private pollInitialized = false;
 	private lastPollSnapshot = "";
 	private result: HeadlessCompletionInfo | undefined;
@@ -186,8 +189,14 @@ export class HeadlessDispatchMonitor {
 		this.pollTimer = null;
 	}
 
-	private async processPollTick(): Promise<void> {
-		if (this._disposed || this.pollInFlight) return;
+	private async processPollTick(options?: { forCompletionFlush?: boolean }): Promise<void> {
+		// Completion flush must not run after dispose; regular ticks also bail when disposed.
+		if (this._disposed) return;
+		if (this.pollInFlight) {
+			if (!options?.forCompletionFlush) return;
+			await this.waitForPollIdle();
+			if (this._disposed) return;
+		}
 		const monitor = this.options.monitor;
 		if (!monitor || monitor.strategy !== "poll-diff") return;
 		this.pollInFlight = true;
@@ -197,6 +206,7 @@ export class HeadlessDispatchMonitor {
 			// (duplicating lines / inflating size) and triggers match stale content.
 			// Diff the live screen via getLogSlice against the previous snapshot instead.
 			const slice = await this.session.getLogSlice({ offset: 0, stripAnsi: true });
+			if (this._disposed && !options?.forCompletionFlush) return;
 			const sample = normalizeMonitorSnapshot(slice.slice);
 			const previous = this.lastPollSnapshot;
 			const firstPoll = !this.pollInitialized;
@@ -225,7 +235,22 @@ export class HeadlessDispatchMonitor {
 			console.error("interactive-shell: poll-diff tick error:", error);
 		} finally {
 			this.pollInFlight = false;
+			this.notifyPollIdle();
 		}
+	}
+
+	private waitForPollIdle(): Promise<void> {
+		if (!this.pollInFlight) return Promise.resolve();
+		return new Promise((resolve) => {
+			this.pollIdleWaiters.push(resolve);
+		});
+	}
+
+	private notifyPollIdle(): void {
+		if (this.pollInFlight || this.pollIdleWaiters.length === 0) return;
+		const waiters = this.pollIdleWaiters;
+		this.pollIdleWaiters = [];
+		for (const resolve of waiters) resolve();
 	}
 
 	private shouldEmitUnique(triggerId: string, lineOrDiff: string): boolean {
@@ -348,15 +373,43 @@ export class HeadlessDispatchMonitor {
 	}
 
 	private handleCompletion(exitCode: number | null, signal?: number, timedOut?: boolean, cancelled?: boolean): void {
-		if (this._disposed) return;
+		if (this._disposed || this.completionStarted) return;
+		this.completionStarted = true;
+
+		// poll-diff: await a final screen sample *before* dispose so triggers matching
+		// the last printed lines still fire. Fire-and-forget raced with deleteMonitor
+		// and dropped the event. Stream monitors only need a sync line-buffer flush.
 		if (this.options.monitor?.strategy === "poll-diff" && this.options.onMonitorEvent) {
-			// Flush any trailing poll-diff delta that arrived between the last tick and
-			// exit (e.g. a final line printed right before the command ends), so a
-			// trigger matching the last output still fires.
-			void this.processPollTick();
-		} else if (this.options.monitor?.strategy !== "poll-diff" && this.options.onMonitorEvent) {
+			void this.completeAfterPollDiffFlush(exitCode, signal, timedOut, cancelled).catch((error) => {
+				console.error("interactive-shell: failed to complete after poll-diff flush:", error);
+			});
+			return;
+		}
+		if (this.options.monitor?.strategy !== "poll-diff" && this.options.onMonitorEvent) {
 			this.processMonitorData("", true);
 		}
+		this.beginDisposedFinalize(exitCode, signal, timedOut, cancelled);
+	}
+
+	private async completeAfterPollDiffFlush(
+		exitCode: number | null,
+		signal?: number,
+		timedOut?: boolean,
+		cancelled?: boolean,
+	): Promise<void> {
+		try {
+			// Serialise with any in-flight interval tick, then sample once more while
+			// still subscribed / not disposed so onMonitorEvent can record the match.
+			await this.processPollTick({ forCompletionFlush: true });
+		} catch (error) {
+			console.error("interactive-shell: poll-diff completion flush error:", error);
+		}
+		if (this._disposed) return;
+		this.beginDisposedFinalize(exitCode, signal, timedOut, cancelled);
+	}
+
+	private beginDisposedFinalize(exitCode: number | null, signal?: number, timedOut?: boolean, cancelled?: boolean): void {
+		if (this._disposed) return;
 		this._disposed = true;
 		this.stopQuietTimer();
 		this.stopPollTimer();
@@ -418,6 +471,7 @@ export class HeadlessDispatchMonitor {
 
 	dispose(): void {
 		if (this._disposed) return;
+		this.completionStarted = true;
 		this._disposed = true;
 		this.stopQuietTimer();
 		this.stopPollTimer();
@@ -427,6 +481,7 @@ export class HeadlessDispatchMonitor {
 			this.timeoutTimer = null;
 		}
 		this.unsubscribe();
+		this.notifyPollIdle();
 		// Run local complete callbacks (e.g. hands-free stopProgressTimers) so
 		// dispose without completion still tears down side-channel timers/listeners.
 		// Does NOT invoke onComplete — dispose is silent by design.

@@ -316,6 +316,75 @@ describe("HeadlessDispatchMonitor", () => {
 		});
 	});
 
+	it("awaits poll-diff flush before completion so final screen can match", async () => {
+		const session = createSession();
+		const order: string[] = [];
+		let getLogCalls = 0;
+		const onMonitorEvent = vi.fn(() => {
+			order.push("event");
+		});
+		const onComplete = vi.fn(() => {
+			order.push("complete");
+		});
+		// First call (completion flush) yields once so dispose would race if not awaited.
+		session.getLogSlice = vi.fn(async () => {
+			getLogCalls += 1;
+			if (getLogCalls === 1) {
+				await Promise.resolve();
+				await Promise.resolve();
+			}
+			return {
+				slice: "build DONE\n",
+				totalLines: 1,
+				totalChars: 11,
+				sliceLineCount: 1,
+			};
+		});
+
+		new HeadlessDispatchMonitor(
+			session,
+			config,
+			{
+				autoExitOnQuiet: false,
+				quietThreshold: 1000,
+				monitor: {
+					strategy: "poll-diff",
+					triggers: [
+						{
+							id: "done",
+							match: (input) => (/DONE/.test(input) ? "DONE" : undefined),
+						},
+					],
+					pollIntervalMs: 60_000,
+					dedupeExactLine: true,
+				},
+				onMonitorEvent,
+			},
+			onComplete,
+		);
+
+		// Exit before any interval tick; final line is only visible via getLogSlice.
+		session.emitExit(0);
+		// Immediately after exit, completion must not have finished (flush still pending).
+		expect(onComplete).not.toHaveBeenCalled();
+
+		await vi.waitFor(() => {
+			expect(onMonitorEvent).toHaveBeenCalled();
+			expect(onComplete).toHaveBeenCalled();
+		});
+
+		expect(onMonitorEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				strategy: "poll-diff",
+				triggerId: "done",
+				matchedText: "DONE",
+			}),
+		);
+		// Event must land before completion callback (deleteMonitor would drop it).
+		expect(order.indexOf("event")).toBeGreaterThanOrEqual(0);
+		expect(order.indexOf("event")).toBeLessThan(order.indexOf("complete"));
+	});
+
 	it("dispose() runs local complete callbacks so hands-free timers stop when the monitor is dismissed", () => {
 		const session = createSession();
 		const onComplete = vi.fn();

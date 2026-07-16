@@ -706,10 +706,15 @@ export class KittyTerminalSession implements TerminalSession {
 			try {
 				const text = await this.client.getText(this.windowId, { extent: "all", ansi: true });
 				const normalized = text.replace(/\r\n/g, "\n");
-				this.lastKittyText = normalized;
-				// Keep stream comparison baseline fresh when views outpace the poll loop.
+				// First live read must ingest into the stream path. Only seeding
+				// previousSnapshot would make the next poll treat the screen as
+				// unchanged, so rawOutput/data listeners (stream monitors, drain,
+				// hands-free progress) never see that initial output — especially
+				// when a sessionId query races ahead of the first poll tick.
 				if (!this.previousSnapshot) {
-					this.previousSnapshot = normalized;
+					this.ingestSnapshot(normalized);
+				} else {
+					this.lastKittyText = normalized;
 				}
 				return wantAnsi ? normalized : stripVTControlCharacters(normalized);
 			} catch (error) {
