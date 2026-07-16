@@ -22,6 +22,7 @@
 		"runtime-coordinator.ts",
 		"session-query.ts",
 		"spawn.ts",
+		"resolve-node-executable.ts",
 		"skills/**/*",
 		"examples/",
 		"banner.png",

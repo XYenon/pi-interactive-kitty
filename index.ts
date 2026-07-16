@@ -20,6 +20,7 @@ import { parseSpawnArgs, resolveSpawn, type SpawnRequest } from "./spawn.js";
 import { translateInput } from "./key-encoding.js";
 import { KittyTerminalSession } from "./kitty-session.js";
 import type { TerminalSession } from "./terminal-session.js";
+import { resolveNodeExecutable } from "./resolve-node-executable.js";
 import { TOOL_NAME, TOOL_LABEL, TOOL_DESCRIPTION, toolParameters, type ToolParams } from "./tool-schema.js";
 import { HeadlessDispatchMonitor } from "./headless-monitor.js";
 import type { HeadlessCompletionInfo, MonitorMatchInfo, MonitorRuntimeConfig, MonitorTriggerMatcher } from "./headless-monitor.js";
@@ -456,7 +457,8 @@ import("node:fs").then((fs) => {
 
 	const encoded = Buffer.from(script, "utf8").toString("base64");
 	const eventCsv = fileWatch.events.join(",");
-	return `${shellQuote(process.execPath)} -e "eval(Buffer.from('${encoded}','base64').toString('utf8'))" ${shellQuote(fileWatch.path)} ${fileWatch.recursive ? "1" : "0"} ${shellQuote(eventCsv)}`;
+	// Plain node only: pi SEA rejects `-e` (treats the arg as an extension path).
+	return `${shellQuote(resolveNodeExecutable())} -e "eval(Buffer.from('${encoded}','base64').toString('utf8'))" ${shellQuote(fileWatch.path)} ${fileWatch.recursive ? "1" : "0"} ${shellQuote(eventCsv)}`;
 }
 
 function compareThreshold(value: number, op: MonitorThresholdOperator, expected: number): boolean {

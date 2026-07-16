@@ -7,6 +7,7 @@ import type { InteractiveShellConfig } from "./config.js";
 import { KittyClient, type KittyWindow } from "./kitty-client.js";
 import { computeRewriteMonitorPayload, computeSnapshotDelta } from "./kitty-snapshot.js";
 import { isNamedKey } from "./key-encoding.js";
+import { resolveNodeExecutable } from "./resolve-node-executable.js";
 import { sliceLogOutput, trimRawOutput, capLinesByMaxChars } from "./session-log.js";
 import type { TerminalSession, TerminalSessionEvents, TerminalSessionOptions } from "./terminal-session.js";
 
@@ -502,8 +503,10 @@ export class KittyTerminalSession implements TerminalSession {
 				const managed = await findManagedWindow(this.client);
 				const isFirst = !managed;
 				const title = options.title ?? `${this.config.kitty?.tabTitlePrefix ?? "pi-shell"}: ${sessionId}`;
+				// Must use a plain Node binary — not process.execPath when the host is
+				// pi's SEA (`pi runner.mjs` starts the TUI instead of the shell runner).
 				const payload = {
-					args: [process.execPath, this.wrapperPath],
+					args: [resolveNodeExecutable(), this.wrapperPath],
 					type: isFirst ? ("os-window" as const) : ("tab" as const),
 					match: managed ? `window_id:${managed.id}` : undefined,
 					window_title: title,
