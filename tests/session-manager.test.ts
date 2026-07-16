@@ -41,6 +41,39 @@ describe("ShellSessionManager", () => {
 		expect(manager.list()).toHaveLength(0);
 	});
 
+	it("peekBackground does not suspend a scheduled cleanup timer", () => {
+		const manager = new ShellSessionManager();
+		const session = createSession() as any;
+		session.exited = true;
+		const id = manager.add('pi "scan"', session, undefined, undefined, { noAutoCleanup: true });
+		manager.scheduleCleanup(id, 5 * 60 * 1000);
+
+		// Incidental dual-lookup (active + background) must not cancel expiry.
+		expect(manager.peekBackground(id)?.id).toBe(id);
+		vi.advanceTimersByTime(5 * 60 * 1000);
+		expect(session.dispose).toHaveBeenCalledTimes(1);
+		expect(manager.list()).toHaveLength(0);
+	});
+
+	it("get() suspends cleanup until restartAutoCleanup re-arms it", () => {
+		const manager = new ShellSessionManager();
+		const session = createSession() as any;
+		session.exited = true;
+		const id = manager.add('pi "scan"', session, undefined, undefined, { noAutoCleanup: true });
+		manager.scheduleCleanup(id, 5 * 60 * 1000);
+
+		expect(manager.get(id)?.id).toBe(id);
+		vi.advanceTimersByTime(5 * 60 * 1000);
+		// Timer was cleared by get(); session still present.
+		expect(session.dispose).not.toHaveBeenCalled();
+		expect(manager.list()).toHaveLength(1);
+
+		manager.restartAutoCleanup(id);
+		vi.advanceTimersByTime(5 * 60 * 1000);
+		expect(session.dispose).toHaveBeenCalledTimes(1);
+		expect(manager.list()).toHaveLength(0);
+	});
+
 	it("killAll kills active sessions and removes background sessions", () => {
 		const manager = new ShellSessionManager();
 		const backgroundSession = createSession() as any;

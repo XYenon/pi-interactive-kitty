@@ -17,6 +17,7 @@ async function setupHarness() {
 		list: vi.fn(() => []),
 		get: vi.fn(() => undefined),
 		hasBackground: vi.fn(() => false),
+		peekBackground: vi.fn(() => undefined),
 		getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),
 		take: vi.fn(() => undefined),
 		restore: vi.fn(),

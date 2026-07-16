@@ -1267,14 +1267,29 @@ function appendWorktreeNotice(text: string, worktreePath: string | undefined): s
  * After the first completed-status poll unregisters active (agent-poll semantics),
  * subsequent sessionId / incremental / drain queries must still reach the kitty tab
  * via the background entry (P-1).
+ *
+ * When active is present, background is **peeked** (no timer suspend). Calling
+ * `get()` here would clear a hands-free/dispatch 5-minute cleanup armed at
+ * completion, and the completed-active path used to return without re-arming it.
+ * Background-only lookups still use `get()` so attach/query suspends cleanup for
+ * the duration of the tool call (callers restart via maybeRestartBackgroundCleanup).
  */
 function resolveSessionById(sessionId: string): {
 	active: ActiveSession | undefined;
 	background: BackgroundSession | undefined;
 } {
 	const active = sessionManager.getActive(sessionId);
+	if (active) {
+		return { active, background: sessionManager.peekBackground(sessionId) };
+	}
 	const background = sessionManager.hasBackground(sessionId) ? sessionManager.get(sessionId) : undefined;
-	return { active, background };
+	return { active: undefined, background };
+}
+
+/** Keep background session expiry armed after active is dropped on completed polls. */
+function ensureBackgroundExpiry(sessionId: string, delayMs = 5 * 60 * 1000): void {
+	// scheduleCleanup is idempotent when a timer is already pending.
+	sessionManager.scheduleCleanup(sessionId, delayMs);
 }
 
 /** After background reads, resume delayed cleanup when no headless monitor owns the session. */
@@ -2449,6 +2464,9 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						// sessionId queries use the background fallback (with full lastResult).
 						persistBackgroundResult(sessionId, result);
 						sessionManager.unregisterActive(sessionId, result.backgrounded === false);
+						// Peek-based resolve leaves any prior expiry timer intact; re-arm in case
+						// completion had not scheduled yet (race) or a prior get() suspended it.
+						ensureBackgroundExpiry(sessionId);
 						return buildCompletedSessionResponse(sessionId, status, runtime, outputResult, result);
 					}
 
@@ -2498,6 +2516,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							if (earlyResult) {
 								persistBackgroundResult(sessionId, earlyResult);
 								sessionManager.unregisterActive(sessionId, earlyResult.backgrounded === false);
+								ensureBackgroundExpiry(sessionId);
 								return buildCompletedSessionResponse(
 									sessionId,
 									earlyStatus,

@@ -208,6 +208,7 @@ async function setupHarness(options?: { onCompleteInfos?: HeadlessCompletionInfo
 			take: vi.fn(() => undefined),
 			get: vi.fn(() => undefined),
 			hasBackground: vi.fn(() => false),
+			peekBackground: vi.fn(() => undefined),
 			setBackgroundResult: vi.fn(),
 			getBackgroundResult: vi.fn(() => undefined),
 			getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),

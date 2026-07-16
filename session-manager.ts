@@ -394,6 +394,16 @@ export class ShellSessionManager {
 		return this.sessions.get(id);
 	}
 
+	/**
+	 * Read a background entry without suspending exit-watcher / cleanup timers.
+	 * Use when an active handle still owns the session (status polls, dual-lookup) so a
+	 * completed hands-free/dispatch expiry timer is not cancelled by incidental lookup.
+	 * Prefer `get()` when this tool call is the primary consumer of the background entry.
+	 */
+	peekBackground(id: string): BackgroundSession | undefined {
+		return this.sessions.get(id);
+	}
+
 	restartAutoCleanup(id: string): void {
 		if (this.exitWatchers.has(id)) return;
 		const entry = this.sessions.get(id);

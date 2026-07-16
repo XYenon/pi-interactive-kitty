@@ -184,6 +184,7 @@ async function setupHarness() {
 			}),
 			take: vi.fn(() => undefined),
 			get: vi.fn((id: string) => bgEntries.get(id)),
+			peekBackground: vi.fn((id: string) => bgEntries.get(id)),
 			hasBackground: vi.fn((id: string) => bgEntries.has(id)),
 			setBackgroundResult: vi.fn((id: string, result: any) => {
 				const entry = bgEntries.get(id);
