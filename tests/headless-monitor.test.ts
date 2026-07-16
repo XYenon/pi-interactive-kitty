@@ -12,6 +12,19 @@ const config: InteractiveShellConfig = {
 		worktree: false,
 		worktreeBaseDir: undefined,
 	},
+	kitty: {
+		listenOn: undefined,
+		remoteControlPassword: undefined,
+		publicKey: undefined,
+		version: [0, 47, 4],
+		responseTimeoutMs: 10000,
+		connectTimeoutMs: 5000,
+		pollIntervalMs: 100,
+		killGraceMs: 5000,
+		osWindowTitle: "pi-interactive-kitty",
+		tabTitlePrefix: "pi-shell",
+		focusNewSessions: true,
+	},
 	scrollbackLines: 5000,
 	ansiReemit: true,
 	handoffPreviewEnabled: true,
@@ -35,11 +48,18 @@ function createSession() {
 	let onData: ((data: string) => void) | null = null;
 	let onExit: ((exitCode: number | null, signal?: number) => void) | null = null;
 	let rawOutput = "";
-	return {
+	const session = {
 		exited: false,
 		exitCode: null as number | null,
 		signal: undefined as number | undefined,
-		kill: vi.fn(),
+		// Mirror KittyTerminalSession.kill(): exit is observed asynchronously after signal/grace.
+		kill: vi.fn(() => {
+			queueMicrotask(() => {
+				if (!session.exited) {
+					session.emitExit(null);
+				}
+			});
+		}),
 		getTailLines: vi.fn(async () => ({ lines: ["final"], totalLinesInBuffer: 1, truncatedByChars: false })),
 		getRawStream: vi.fn(() => rawOutput),
 		getLogSlice: vi.fn(async (opts?: { offset?: number; stripAnsi?: boolean }) => ({
@@ -70,7 +90,8 @@ function createSession() {
 			this.signal = signal;
 			onExit?.(exitCode, signal);
 		},
-	} as any;
+	};
+	return session as any;
 }
 
 describe("HeadlessDispatchMonitor", () => {
@@ -315,5 +336,88 @@ describe("HeadlessDispatchMonitor", () => {
 		expect(localComplete).toHaveBeenCalledTimes(1);
 		expect(onComplete).not.toHaveBeenCalled();
 		expect(monitor.disposed).toBe(true);
+	});
+
+	it("cancel waits for session exit before capturing completion output", async () => {
+		const session = createSession();
+		let capturedWhileExited = false;
+		session.kill = vi.fn(() => {
+			// Delayed exit: cleanup output becomes available only after kill drains.
+			setTimeout(() => {
+				session.emitData("cleanup done\n");
+				session.getTailLines = vi.fn(async () => {
+					capturedWhileExited = session.exited;
+					return { lines: ["cleanup done"], totalLinesInBuffer: 1, truncatedByChars: false };
+				});
+				session.emitExit(143, 15);
+			}, 50);
+		});
+		const onComplete = vi.fn();
+		const monitor = new HeadlessDispatchMonitor(
+			session,
+			config,
+			{
+				autoExitOnQuiet: false,
+				quietThreshold: 1000,
+			},
+			onComplete,
+		);
+
+		monitor.cancel();
+		expect(session.kill).toHaveBeenCalledTimes(1);
+		expect(onComplete).not.toHaveBeenCalled();
+
+		await vi.advanceTimersByTimeAsync(50);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(capturedWhileExited).toBe(true);
+		expect(onComplete).toHaveBeenCalledWith({
+			exitCode: 143,
+			signal: 15,
+			timedOut: undefined,
+			cancelled: true,
+			completionOutput: {
+				lines: ["cleanup done"],
+				totalLines: 1,
+				truncated: false,
+			},
+		});
+		expect(monitor.getResult()?.cancelled).toBe(true);
+	});
+
+	it("cancel skips kill and uses current exit status when session already exited", async () => {
+		const session = createSession();
+		const onComplete = vi.fn();
+		const monitor = new HeadlessDispatchMonitor(
+			session,
+			config,
+			{
+				autoExitOnQuiet: false,
+				quietThreshold: 1000,
+			},
+			onComplete,
+		);
+
+		// Session exited without firing the exit listener (e.g. observed via polling/status).
+		session.exited = true;
+		session.exitCode = 7;
+		monitor.cancel();
+
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(session.kill).not.toHaveBeenCalled();
+		expect(onComplete).toHaveBeenCalledWith({
+			exitCode: 7,
+			signal: undefined,
+			timedOut: undefined,
+			cancelled: true,
+			completionOutput: {
+				lines: ["final"],
+				totalLines: 1,
+				truncated: false,
+			},
+		});
 	});
 });

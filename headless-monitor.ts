@@ -56,6 +56,13 @@ export class HeadlessDispatchMonitor {
 	private quietTimer: ReturnType<typeof setTimeout> | null = null;
 	private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 	private pollTimer: ReturnType<typeof setInterval> | null = null;
+	/** Bound wait for forced kill (cancel/timeout/quiet) so completion cannot hang forever. */
+	private killWaitTimer: ReturnType<typeof setTimeout> | null = null;
+	/**
+	 * When set, we requested a forced shutdown and are waiting for the session to exit
+	 * (or for killWaitTimer) before finalizing so captureOutput sees post-SIGTERM cleanup.
+	 */
+	private forcedCompletion: { cancelled?: boolean; timedOut?: boolean } | null = null;
 	private pollInFlight = false;
 	private pollInitialized = false;
 	private lastPollSnapshot = "";
@@ -86,7 +93,7 @@ export class HeadlessDispatchMonitor {
 
 		if (options.timeout && options.timeout > 0) {
 			this.timeoutTimer = setTimeout(() => {
-				this.handleCompletion(null, undefined, true);
+				this.requestForcedCompletion({ timedOut: true });
 			}, options.timeout);
 		}
 
@@ -116,7 +123,8 @@ export class HeadlessDispatchMonitor {
 		});
 		this.unsubExit = this.session.addExitListener((exitCode, signal) => {
 			if (!this._disposed) {
-				this.handleCompletion(exitCode, signal);
+				const forced = this.forcedCompletion;
+				this.handleCompletion(exitCode, signal, forced?.timedOut, forced?.cancelled);
 			}
 		});
 	}
@@ -264,8 +272,9 @@ export class HeadlessDispatchMonitor {
 					this.resetQuietTimer();
 					return;
 				}
-				this.session.kill();
-				this.handleCompletion(null, undefined, false, true);
+				// Kill first, then finalize only after exit so completion output includes
+				// any trap/cleanup lines printed while the child drains.
+				this.requestForcedCompletion({ cancelled: true });
 			}
 		}, this.options.quietThreshold);
 	}
@@ -275,6 +284,49 @@ export class HeadlessDispatchMonitor {
 			clearTimeout(this.quietTimer);
 			this.quietTimer = null;
 		}
+	}
+
+	private stopKillWaitTimer(): void {
+		if (this.killWaitTimer) {
+			clearTimeout(this.killWaitTimer);
+			this.killWaitTimer = null;
+		}
+	}
+
+	/**
+	 * Force-stop the monitored session (cancel / timeout / quiet auto-exit).
+	 * Waits for the session exit (or killGraceMs + slack) before capturing output so
+	 * SIGTERM handlers that print cleanup logs are reflected in completionOutput, and
+	 * the real exit code from the exit file is preserved when available.
+	 */
+	private requestForcedCompletion(flags: { cancelled?: boolean; timedOut?: boolean }): void {
+		if (this._disposed || this.forcedCompletion) return;
+		this.forcedCompletion = flags;
+
+		// Stop re-triggers while we wait for kill/exit; keep exit subscription active.
+		this.stopQuietTimer();
+		this.stopPollTimer();
+		if (this.timeoutTimer) {
+			clearTimeout(this.timeoutTimer);
+			this.timeoutTimer = null;
+		}
+
+		if (this.session.exited) {
+			this.handleCompletion(this.session.exitCode, this.session.signal, flags.timedOut, flags.cancelled);
+			return;
+		}
+
+		this.session.kill();
+
+		// KittyTerminalSession.kill() always markExited within killGraceMs (force-close).
+		// Bound wait so a broken/mock session cannot hang complete callbacks forever.
+		const graceMs = this.config.kitty?.killGraceMs ?? 5000;
+		this.killWaitTimer = setTimeout(() => {
+			this.killWaitTimer = null;
+			if (!this._disposed && this.forcedCompletion) {
+				this.handleCompletion(this.session.exitCode, this.session.signal, flags.timedOut, flags.cancelled);
+			}
+		}, graceMs + 500);
 	}
 
 	private async captureOutput(): Promise<HeadlessCompletionInfo["completionOutput"]> {
@@ -308,15 +360,12 @@ export class HeadlessDispatchMonitor {
 		this._disposed = true;
 		this.stopQuietTimer();
 		this.stopPollTimer();
+		this.stopKillWaitTimer();
 		if (this.timeoutTimer) {
 			clearTimeout(this.timeoutTimer);
 			this.timeoutTimer = null;
 		}
 		this.unsubscribe();
-
-		if (timedOut) {
-			this.session.kill();
-		}
 
 		void this.finalizeCompletion(exitCode, signal, timedOut, cancelled).catch((error) => {
 			console.error("interactive-shell: failed to finalize completion:", error);
@@ -332,9 +381,7 @@ export class HeadlessDispatchMonitor {
 	}
 
 	cancel(): void {
-		if (this._disposed) return;
-		this.handleCompletion(null, undefined, false, true);
-		this.session.kill();
+		this.requestForcedCompletion({ cancelled: true });
 	}
 
 	getResult(): HeadlessCompletionInfo | undefined {
@@ -374,6 +421,7 @@ export class HeadlessDispatchMonitor {
 		this._disposed = true;
 		this.stopQuietTimer();
 		this.stopPollTimer();
+		this.stopKillWaitTimer();
 		if (this.timeoutTimer) {
 			clearTimeout(this.timeoutTimer);
 			this.timeoutTimer = null;
