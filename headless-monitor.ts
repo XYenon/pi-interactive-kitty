@@ -1,5 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
-import type { PtyTerminalSession } from "./pty-session.js";
+import type { TerminalSession } from "./terminal-session.js";
 import type { InteractiveShellConfig } from "./config.js";
 
 export interface MonitorMatchInfo {
@@ -8,7 +8,7 @@ export interface MonitorMatchInfo {
 	eventType: string;
 	matchedText: string;
 	lineOrDiff: string;
-	stream: "pty";
+	stream: "terminal";
 }
 
 export interface MonitorTriggerMatcher {
@@ -56,10 +56,19 @@ export class HeadlessDispatchMonitor {
 	private quietTimer: ReturnType<typeof setTimeout> | null = null;
 	private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 	private pollTimer: ReturnType<typeof setInterval> | null = null;
+	/** Bound wait for forced kill (cancel/timeout/quiet) so completion cannot hang forever. */
+	private killWaitTimer: ReturnType<typeof setTimeout> | null = null;
+	/**
+	 * When set, we requested a forced shutdown and are waiting for the session to exit
+	 * (or for killWaitTimer) before finalizing so captureOutput sees post-SIGTERM cleanup.
+	 */
+	private forcedCompletion: { cancelled?: boolean; timedOut?: boolean } | null = null;
+	/** True once completion has started (flush may still be in progress before dispose). */
+	private completionStarted = false;
 	private pollInFlight = false;
+	private pollIdleWaiters: Array<() => void> = [];
 	private pollInitialized = false;
 	private lastPollSnapshot = "";
-	private pollReadOffset = 0;
 	private result: HeadlessCompletionInfo | undefined;
 	private completeCallbacks: Array<() => void> = [];
 	private unsubData: (() => void) | null = null;
@@ -68,10 +77,12 @@ export class HeadlessDispatchMonitor {
 	private emittedMonitorKeys = new Set<string>();
 	private triggerLastEmitAt = new Map<string, number>();
 
-	get disposed(): boolean { return this._disposed; }
+	get disposed(): boolean {
+		return this._disposed;
+	}
 
 	constructor(
-		private session: PtyTerminalSession,
+		private session: TerminalSession,
 		private config: InteractiveShellConfig,
 		private options: HeadlessMonitorOptions,
 		private onComplete: (info: HeadlessCompletionInfo) => void,
@@ -85,7 +96,7 @@ export class HeadlessDispatchMonitor {
 
 		if (options.timeout && options.timeout > 0) {
 			this.timeoutTimer = setTimeout(() => {
-				this.handleCompletion(null, undefined, true);
+				this.requestForcedCompletion({ timedOut: true });
 			}, options.timeout);
 		}
 
@@ -115,7 +126,8 @@ export class HeadlessDispatchMonitor {
 		});
 		this.unsubExit = this.session.addExitListener((exitCode, signal) => {
 			if (!this._disposed) {
-				this.handleCompletion(exitCode, signal);
+				const forced = this.forcedCompletion;
+				this.handleCompletion(exitCode, signal, forced?.timedOut, forced?.cancelled);
 			}
 		});
 	}
@@ -157,7 +169,7 @@ export class HeadlessDispatchMonitor {
 				eventType: trigger.id,
 				matchedText,
 				lineOrDiff: line,
-				stream: "pty",
+				stream: "terminal",
 			});
 		}
 	}
@@ -177,27 +189,33 @@ export class HeadlessDispatchMonitor {
 		this.pollTimer = null;
 	}
 
-	private async processPollTick(): Promise<void> {
-		if (this._disposed || this.pollInFlight) return;
+	private async processPollTick(options?: { forCompletionFlush?: boolean }): Promise<void> {
+		// Completion flush must not run after dispose; regular ticks also bail when disposed.
+		if (this._disposed) return;
+		if (this.pollInFlight) {
+			if (!options?.forCompletionFlush) return;
+			await this.waitForPollIdle();
+			if (this._disposed) return;
+		}
 		const monitor = this.options.monitor;
 		if (!monitor || monitor.strategy !== "poll-diff") return;
 		this.pollInFlight = true;
 		try {
-			const raw = this.session.getRawStream({ sinceLast: false, stripAnsi: true });
-			if (this.pollReadOffset > raw.length) {
-				this.pollReadOffset = raw.length;
-			}
-			const sample = normalizeMonitorSnapshot(raw.slice(this.pollReadOffset));
-			this.pollReadOffset = raw.length;
-			if (!this.pollInitialized) {
-				this.lastPollSnapshot = sample;
-				this.pollInitialized = true;
-				return;
-			}
-			if (sample === this.lastPollSnapshot) return;
+			// Pitfall: do NOT use getRawStream() here. That append-only buffer accumulates
+			// full get-text snapshots across polls, so each tick re-adds the whole screen
+			// (duplicating lines / inflating size) and triggers match stale content.
+			// Diff the live screen via getLogSlice against the previous snapshot instead.
+			const slice = await this.session.getLogSlice({ offset: 0, stripAnsi: true });
+			if (this._disposed && !options?.forCompletionFlush) return;
+			const sample = normalizeMonitorSnapshot(slice.slice);
 			const previous = this.lastPollSnapshot;
+			const firstPoll = !this.pollInitialized;
 			this.lastPollSnapshot = sample;
-			const diffSummary = summarizeDiff(previous, sample);
+			this.pollInitialized = true;
+			if (!firstPoll && sample === previous) return;
+			// First poll still runs trigger matching: content already on screen when the
+			// monitor starts must match (diffs alone would miss a static initial snapshot).
+			const diffSummary = firstPoll ? "initial snapshot" : summarizeDiff(previous, sample);
 
 			for (const trigger of monitor.triggers) {
 				const matchedText = trigger.match(sample);
@@ -210,14 +228,29 @@ export class HeadlessDispatchMonitor {
 					eventType: trigger.id,
 					matchedText,
 					lineOrDiff: diffSummary,
-					stream: "pty",
+					stream: "terminal",
 				});
 			}
 		} catch (error) {
 			console.error("interactive-shell: poll-diff tick error:", error);
 		} finally {
 			this.pollInFlight = false;
+			this.notifyPollIdle();
 		}
+	}
+
+	private waitForPollIdle(): Promise<void> {
+		if (!this.pollInFlight) return Promise.resolve();
+		return new Promise((resolve) => {
+			this.pollIdleWaiters.push(resolve);
+		});
+	}
+
+	private notifyPollIdle(): void {
+		if (this.pollInFlight || this.pollIdleWaiters.length === 0) return;
+		const waiters = this.pollIdleWaiters;
+		this.pollIdleWaiters = [];
+		for (const resolve of waiters) resolve();
 	}
 
 	private shouldEmitUnique(triggerId: string, lineOrDiff: string): boolean {
@@ -264,8 +297,9 @@ export class HeadlessDispatchMonitor {
 					this.resetQuietTimer();
 					return;
 				}
-				this.session.kill();
-				this.handleCompletion(null, undefined, false, true);
+				// Kill first, then finalize only after exit so completion output includes
+				// any trap/cleanup lines printed while the child drains.
+				this.requestForcedCompletion({ cancelled: true });
 			}
 		}, this.options.quietThreshold);
 	}
@@ -277,9 +311,52 @@ export class HeadlessDispatchMonitor {
 		}
 	}
 
-	private captureOutput(): HeadlessCompletionInfo["completionOutput"] {
+	private stopKillWaitTimer(): void {
+		if (this.killWaitTimer) {
+			clearTimeout(this.killWaitTimer);
+			this.killWaitTimer = null;
+		}
+	}
+
+	/**
+	 * Force-stop the monitored session (cancel / timeout / quiet auto-exit).
+	 * Waits for the session exit (or killGraceMs + slack) before capturing output so
+	 * SIGTERM handlers that print cleanup logs are reflected in completionOutput, and
+	 * the real exit code from the exit file is preserved when available.
+	 */
+	private requestForcedCompletion(flags: { cancelled?: boolean; timedOut?: boolean }): void {
+		if (this._disposed || this.forcedCompletion) return;
+		this.forcedCompletion = flags;
+
+		// Stop re-triggers while we wait for kill/exit; keep exit subscription active.
+		this.stopQuietTimer();
+		this.stopPollTimer();
+		if (this.timeoutTimer) {
+			clearTimeout(this.timeoutTimer);
+			this.timeoutTimer = null;
+		}
+
+		if (this.session.exited) {
+			this.handleCompletion(this.session.exitCode, this.session.signal, flags.timedOut, flags.cancelled);
+			return;
+		}
+
+		this.session.kill();
+
+		// KittyTerminalSession.kill() always markExited within killGraceMs (force-close).
+		// Bound wait so a broken/mock session cannot hang complete callbacks forever.
+		const graceMs = this.config.kitty?.killGraceMs ?? 5000;
+		this.killWaitTimer = setTimeout(() => {
+			this.killWaitTimer = null;
+			if (!this._disposed && this.forcedCompletion) {
+				this.handleCompletion(this.session.exitCode, this.session.signal, flags.timedOut, flags.cancelled);
+			}
+		}, graceMs + 500);
+	}
+
+	private async captureOutput(): Promise<HeadlessCompletionInfo["completionOutput"]> {
 		try {
-			const result = this.session.getTailLines({
+			const result = await this.session.getTailLines({
 				lines: this.config.completionNotifyLines,
 				ansi: false,
 				maxChars: this.config.completionNotifyMaxChars,
@@ -296,47 +373,81 @@ export class HeadlessDispatchMonitor {
 	}
 
 	private handleCompletion(exitCode: number | null, signal?: number, timedOut?: boolean, cancelled?: boolean): void {
-		if (this._disposed) return;
+		if (this._disposed || this.completionStarted) return;
+		this.completionStarted = true;
+
+		// poll-diff: await a final screen sample *before* dispose so triggers matching
+		// the last printed lines still fire. Fire-and-forget raced with deleteMonitor
+		// and dropped the event. Stream monitors only need a sync line-buffer flush.
+		if (this.options.monitor?.strategy === "poll-diff" && this.options.onMonitorEvent) {
+			void this.completeAfterPollDiffFlush(exitCode, signal, timedOut, cancelled).catch((error) => {
+				console.error("interactive-shell: failed to complete after poll-diff flush:", error);
+			});
+			return;
+		}
 		if (this.options.monitor?.strategy !== "poll-diff" && this.options.onMonitorEvent) {
 			this.processMonitorData("", true);
 		}
+		this.beginDisposedFinalize(exitCode, signal, timedOut, cancelled);
+	}
+
+	private async completeAfterPollDiffFlush(
+		exitCode: number | null,
+		signal?: number,
+		timedOut?: boolean,
+		cancelled?: boolean,
+	): Promise<void> {
+		try {
+			// Serialise with any in-flight interval tick, then sample once more while
+			// still subscribed / not disposed so onMonitorEvent can record the match.
+			await this.processPollTick({ forCompletionFlush: true });
+		} catch (error) {
+			console.error("interactive-shell: poll-diff completion flush error:", error);
+		}
+		if (this._disposed) return;
+		this.beginDisposedFinalize(exitCode, signal, timedOut, cancelled);
+	}
+
+	private beginDisposedFinalize(exitCode: number | null, signal?: number, timedOut?: boolean, cancelled?: boolean): void {
+		if (this._disposed) return;
 		this._disposed = true;
 		this.stopQuietTimer();
 		this.stopPollTimer();
-		if (this.timeoutTimer) { clearTimeout(this.timeoutTimer); this.timeoutTimer = null; }
+		this.stopKillWaitTimer();
+		if (this.timeoutTimer) {
+			clearTimeout(this.timeoutTimer);
+			this.timeoutTimer = null;
+		}
 		this.unsubscribe();
 
-		if (timedOut) {
-			this.session.kill();
-		}
+		void this.finalizeCompletion(exitCode, signal, timedOut, cancelled).catch((error) => {
+			console.error("interactive-shell: failed to finalize completion:", error);
+		});
+	}
 
-		const completionOutput = this.captureOutput();
+	private async finalizeCompletion(exitCode: number | null, signal?: number, timedOut?: boolean, cancelled?: boolean): Promise<void> {
+		const completionOutput = await this.captureOutput();
 		const info: HeadlessCompletionInfo = { exitCode, signal, timedOut, cancelled, completionOutput };
 		this.result = info;
 		this.triggerCompleteCallbacks();
 		this.onComplete(info);
 	}
 
-	handleExternalCompletion(exitCode: number | null, signal?: number, completionOutput?: HeadlessCompletionInfo["completionOutput"]): void {
-		if (this._disposed) return;
-		if (this.options.monitor?.strategy !== "poll-diff" && this.options.onMonitorEvent) {
-			this.processMonitorData("", true);
-		}
-		this._disposed = true;
-		this.stopQuietTimer();
-		this.stopPollTimer();
-		if (this.timeoutTimer) { clearTimeout(this.timeoutTimer); this.timeoutTimer = null; }
-		this.unsubscribe();
-
-		const output = completionOutput ?? this.captureOutput();
-		const info: HeadlessCompletionInfo = { exitCode, signal, completionOutput: output };
-		this.result = info;
-		this.triggerCompleteCallbacks();
-		this.onComplete(info);
+	cancel(): void {
+		this.requestForcedCompletion({ cancelled: true });
 	}
 
 	getResult(): HeadlessCompletionInfo | undefined {
 		return this.result;
+	}
+
+	/** Dynamically update the quiet-threshold used by autoExitOnQuiet (and re-arm the timer if active). */
+	setQuietThreshold(thresholdMs: number): void {
+		const clamped = Math.max(1000, Math.min(300000, Math.trunc(thresholdMs)));
+		this.options.quietThreshold = clamped;
+		if (this.options.autoExitOnQuiet && !this._disposed && this.quietTimer) {
+			this.resetQuietTimer();
+		}
 	}
 
 	registerCompleteCallback(callback: () => void): void {
@@ -360,20 +471,28 @@ export class HeadlessDispatchMonitor {
 
 	dispose(): void {
 		if (this._disposed) return;
+		this.completionStarted = true;
 		this._disposed = true;
 		this.stopQuietTimer();
 		this.stopPollTimer();
-		if (this.timeoutTimer) { clearTimeout(this.timeoutTimer); this.timeoutTimer = null; }
+		this.stopKillWaitTimer();
+		if (this.timeoutTimer) {
+			clearTimeout(this.timeoutTimer);
+			this.timeoutTimer = null;
+		}
 		this.unsubscribe();
+		this.notifyPollIdle();
+		// Run local complete callbacks (e.g. hands-free stopProgressTimers) so
+		// dispose without completion still tears down side-channel timers/listeners.
+		// Does NOT invoke onComplete — dispose is silent by design.
+		this.triggerCompleteCallbacks();
 	}
 }
 
 function normalizeMonitorSnapshot(raw: string): string {
 	if (!raw) return "";
 	const normalizedLineEndings = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	return normalizedLineEndings
-		.replace(/[\t ]+$/gm, "")
-		.trimEnd();
+	return normalizedLineEndings.replace(/[\t ]+$/gm, "").trimEnd();
 }
 
 function summarizeDiff(previous: string, current: string): string {

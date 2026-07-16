@@ -1,11 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { isKeyRelease, isKeyRepeat, matchesKey } from "@mariozechner/pi-tui";
-import { InteractiveShellOverlay } from "./overlay-component.js";
-import { ReattachOverlay } from "./reattach-overlay.js";
-import { PtyTerminalSession } from "./pty-session.js";
 import { formatDuration, formatDurationMs } from "./types.js";
 import type {
 	HandsFreeUpdate,
+	InteractiveShellOptions,
 	InteractiveShellResult,
 	MonitorConfig,
 	MonitorEventPayload,
@@ -15,33 +12,40 @@ import type {
 	MonitorThresholdOperator,
 	MonitorTriggerConfig,
 } from "./types.js";
-import { sessionManager, generateSessionId } from "./session-manager.js";
+import { sessionManager, generateSessionId, releaseSessionId } from "./session-manager.js";
+import type { ActiveSession, ActiveSessionResult, BackgroundSession } from "./session-manager.js";
 import { loadConfig } from "./config.js";
 import type { InteractiveShellConfig } from "./config.js";
 import { parseSpawnArgs, resolveSpawn, type SpawnRequest } from "./spawn.js";
 import { translateInput } from "./key-encoding.js";
+import { KittyTerminalSession } from "./kitty-session.js";
+import type { TerminalSession } from "./terminal-session.js";
+import { resolveNodeExecutable } from "./resolve-node-executable.js";
 import { TOOL_NAME, TOOL_LABEL, TOOL_DESCRIPTION, toolParameters, type ToolParams } from "./tool-schema.js";
 import { HeadlessDispatchMonitor } from "./headless-monitor.js";
-import type {
-	HeadlessCompletionInfo,
-	MonitorMatchInfo,
-	MonitorRuntimeConfig,
-	MonitorTriggerMatcher,
-} from "./headless-monitor.js";
+import type { HeadlessCompletionInfo, MonitorMatchInfo, MonitorRuntimeConfig, MonitorTriggerMatcher } from "./headless-monitor.js";
 import { setupBackgroundWidget } from "./background-widget.js";
-import { buildDispatchNotification, buildHandsFreeUpdateMessage, buildMonitorEventNotification, buildMonitorLifecycleNotification, buildResultNotification, summarizeInteractiveResult } from "./notification-utils.js";
-import { createSessionQueryState, getSessionOutput } from "./session-query.js";
+import {
+	buildDispatchNotification,
+	buildHandsFreeUpdateMessage,
+	buildMonitorEventNotification,
+	buildMonitorLifecycleNotification,
+	buildResultNotification,
+	summarizeInteractiveResult,
+} from "./notification-utils.js";
+import { getSessionOutput } from "./session-query.js";
 import { InteractiveShellCoordinator } from "./runtime-coordinator.js";
+import { captureCompletionOutput, maybeBuildHandoffPreview, maybeWriteHandoffSnapshot } from "./handoff-utils.js";
 import { spawn as spawnChildProcess } from "node:child_process";
 
 const coordinator = new InteractiveShellCoordinator();
-const SIDE_CHAT_SHORTCUT = "alt+/";
 
 function scheduleMonitorHistoryCleanup(sessionId: string, delayMs = 5 * 60 * 1000): void {
 	const attempt = () => {
-		const stillInUse = Boolean(coordinator.getMonitor(sessionId))
-			|| Boolean(sessionManager.getActive(sessionId))
-			|| sessionManager.list().some((session) => session.id === sessionId);
+		const stillInUse =
+			coordinator.getMonitor(sessionId) !== undefined ||
+			sessionManager.getActive(sessionId) !== undefined ||
+			sessionManager.list().some((session) => session.id === sessionId);
 		if (stillInUse) {
 			setTimeout(attempt, 30_000);
 			return;
@@ -51,28 +55,300 @@ function scheduleMonitorHistoryCleanup(sessionId: string, delayMs = 5 * 60 * 100
 	setTimeout(attempt, delayMs);
 }
 
+type HandoffParamOverrides = Pick<
+	InteractiveShellOptions,
+	| "handoffPreviewEnabled"
+	| "handoffPreviewLines"
+	| "handoffPreviewMaxChars"
+	| "handoffSnapshotEnabled"
+	| "handoffSnapshotLines"
+	| "handoffSnapshotMaxChars"
+>;
+
+function handoffOverridesFromParams(
+	handoffPreview?: ToolParams["handoffPreview"],
+	handoffSnapshot?: ToolParams["handoffSnapshot"],
+): HandoffParamOverrides {
+	return {
+		handoffPreviewEnabled: handoffPreview?.enabled,
+		handoffPreviewLines: handoffPreview?.lines,
+		handoffPreviewMaxChars: handoffPreview?.maxChars,
+		handoffSnapshotEnabled: handoffSnapshot?.enabled,
+		handoffSnapshotLines: handoffSnapshot?.lines,
+		handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
+	};
+}
+
+function handoffWhenFromCompletion(info: { timedOut?: boolean; cancelled?: boolean }): "exit" | "kill" | "timeout" {
+	if (info.timedOut) return "timeout";
+	if (info.cancelled) return "kill";
+	return "exit";
+}
+
+/** Shared notes for session output blocks in tool responses. */
+function outputDisplayNotes(
+	truncated: boolean,
+	totalBytes: number,
+	hasMore?: boolean,
+): {
+	truncatedNote: string;
+	hasMoreNote: string;
+} {
+	return {
+		truncatedNote: truncated ? ` (${totalBytes} bytes total, truncated)` : "",
+		hasMoreNote: hasMore === true ? " (more available)" : "",
+	};
+}
+
+function describeInputPayload(input: string | { text?: string; keys?: string[]; paste?: string; hex?: string[] } | undefined): string {
+	if (input === undefined) return "";
+	if (typeof input === "string") {
+		if (input.length === 0) return "(empty)";
+		if (input.length > 50) return `${input.slice(0, 50)}...`;
+		return input;
+	}
+	const parts = [
+		input.text ?? "",
+		input.keys ? `keys:[${input.keys.join(",")}]` : "",
+		input.hex ? `hex:[${input.hex.length} bytes]` : "",
+		input.paste ? `paste:[${input.paste.length} chars]` : "",
+	].filter(Boolean);
+	return parts.join(" + ") || "(empty)";
+}
+
+async function buildHandoffArtifacts(
+	session: TerminalSession,
+	when: "exit" | "detach" | "kill" | "timeout",
+	config: InteractiveShellConfig,
+	context: { command: string; cwd?: string },
+	overrides?: HandoffParamOverrides,
+): Promise<Pick<ActiveSessionResult, "handoffPreview" | "handoff">> {
+	return {
+		handoffPreview: await maybeBuildHandoffPreview(session, when, config, overrides),
+		handoff: await maybeWriteHandoffSnapshot(session, when, config, context, overrides),
+	};
+}
+
+type RegisteredHandoffContext = {
+	session: TerminalSession;
+	config: InteractiveShellConfig;
+	context: { command: string; cwd?: string };
+	overrides: HandoffParamOverrides;
+};
+
+const handoffContexts = new Map<string, RegisteredHandoffContext>();
+
+function registerHandoffContext(
+	id: string,
+	session: TerminalSession,
+	config: InteractiveShellConfig,
+	context: { command: string; cwd?: string },
+	overrides: HandoffParamOverrides,
+): void {
+	handoffContexts.set(id, { session, config, context, overrides });
+}
+
+async function buildRegisteredHandoffArtifacts(
+	id: string,
+	when: "exit" | "detach" | "kill" | "timeout",
+): Promise<Pick<ActiveSessionResult, "handoffPreview" | "handoff"> | undefined> {
+	const registered = handoffContexts.get(id);
+	if (!registered) return undefined;
+	return buildHandoffArtifacts(registered.session, when, registered.config, registered.context, registered.overrides);
+}
+
+function clearHandoffContext(id: string): void {
+	handoffContexts.delete(id);
+}
+
+/** Unified 5-minute expiry for hands-free: drop active handle + handoff context + bg session. */
+function scheduleHandsFreeExpiry(sessionId: string, delayMs = 5 * 60 * 1000): void {
+	setTimeout(() => {
+		if (sessionManager.getActive(sessionId)?.getResult()) {
+			sessionManager.unregisterActive(sessionId, false);
+		}
+		clearHandoffContext(sessionId);
+	}, delayMs);
+	sessionManager.scheduleCleanup(sessionId, delayMs);
+}
+
+function completedSessionQueryDetails(
+	sessionId: string,
+	status: string,
+	runtime: number,
+	output: {
+		output: string;
+		truncated: boolean;
+		totalBytes: number;
+		totalLines?: number;
+		hasMore?: boolean;
+	},
+	result: ActiveSessionResult,
+): Record<string, unknown> {
+	return {
+		sessionId,
+		status,
+		runtime,
+		output: output.output,
+		outputTruncated: output.truncated,
+		outputTotalBytes: output.totalBytes,
+		outputTotalLines: output.totalLines,
+		hasMore: output.hasMore,
+		exitCode: result.exitCode,
+		signal: result.signal,
+		backgroundId: result.backgroundId,
+		backgrounded: result.backgrounded,
+		timedOut: result.timedOut,
+		cancelled: result.cancelled,
+		handoffPreview: result.handoffPreview,
+		handoff: result.handoff,
+	};
+}
+
+function buildCompletedSessionResponse(
+	sessionId: string,
+	status: string,
+	runtime: number,
+	outputResult: { output: string; truncated: boolean; totalBytes: number; totalLines?: number; hasMore?: boolean },
+	result: ActiveSessionResult,
+): {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+} {
+	const { truncatedNote, hasMoreNote } = outputDisplayNotes(outputResult.truncated, outputResult.totalBytes, outputResult.hasMore);
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Session ${sessionId} ${status} after ${formatDurationMs(runtime)}${outputResult.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${outputResult.output}` : ""}`,
+			},
+		],
+		details: completedSessionQueryDetails(sessionId, status, runtime, outputResult, result),
+	};
+}
+
+async function getBackgroundOutputResponse(
+	sessionId: string,
+	bgSession: BackgroundSession,
+	cwd: string,
+	opts: {
+		outputLines?: number;
+		outputMaxChars?: number;
+		outputOffset?: number;
+		drain?: boolean;
+		incremental?: boolean;
+	},
+): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}> {
+	const queried = await queryBackgroundSessionOutput(sessionId, bgSession, cwd, opts);
+	const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
+	const outputBlock = {
+		output: queried.output,
+		truncated: queried.truncated,
+		totalBytes: queried.totalBytes,
+		totalLines: queried.totalLines,
+		hasMore: queried.hasMore,
+	};
+	if (queried.lastResult) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Session ${sessionId} ${queried.status} after ${formatDurationMs(queried.runtime)}${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+				},
+			],
+			details: completedSessionQueryDetails(sessionId, queried.status, queried.runtime, outputBlock, queried.lastResult),
+		};
+	}
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Session ${sessionId} ${queried.status} (${formatDurationMs(queried.runtime)})${queried.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+			},
+		],
+		details: {
+			sessionId,
+			status: queried.status,
+			runtime: queried.runtime,
+			...outputBlock,
+			outputTruncated: queried.truncated,
+			outputTotalBytes: queried.totalBytes,
+			outputTotalLines: queried.totalLines,
+			hasOutput: queried.output.length > 0,
+		},
+	};
+}
+
+async function resolveHandoffForCompletion(
+	info: HeadlessCompletionInfo,
+	opts?: {
+		session?: TerminalSession;
+		config?: InteractiveShellConfig;
+		command?: string;
+		cwd?: string;
+		handoff?: HandoffParamOverrides;
+		storedResult?: { current: ActiveSessionResult | undefined };
+	},
+): Promise<Pick<ActiveSessionResult, "handoffPreview" | "handoff">> {
+	const result = opts?.storedResult?.current;
+	if (result) {
+		return { handoffPreview: result.handoffPreview, handoff: result.handoff };
+	}
+	if (opts?.session && opts.config && opts.command) {
+		return buildHandoffArtifacts(
+			opts.session,
+			handoffWhenFromCompletion(info),
+			opts.config,
+			{ command: opts.command, cwd: opts.cwd },
+			opts.handoff,
+		);
+	}
+	return {};
+}
+
 function makeMonitorCompletionCallback(
 	pi: ExtensionAPI,
 	id: string,
 	startTime: number,
+	opts?: {
+		session?: TerminalSession;
+		config?: InteractiveShellConfig;
+		command?: string;
+		cwd?: string;
+		handoff?: HandoffParamOverrides;
+		storedResult?: { current: ActiveSessionResult | undefined };
+	},
 ): (info: HeadlessCompletionInfo) => void {
 	return (info) => {
-		const wasAgentHandled = coordinator.consumeAgentHandledCompletion(id);
-		if (!wasAgentHandled) {
-			const duration = formatDuration(Date.now() - startTime);
-			const content = buildDispatchNotification(id, info, duration);
-			pi.sendMessage({
-				customType: "interactive-shell-transfer",
-				content,
-				display: true,
-				details: { sessionId: id, duration, ...info },
-			}, { triggerTurn: true });
-			pi.events.emit("interactive-shell:transfer", { sessionId: id, ...info });
-		}
-		sessionManager.unregisterActive(id, false);
-		coordinator.deleteMonitor(id);
-		scheduleMonitorHistoryCleanup(id);
-		sessionManager.scheduleCleanup(id, 5 * 60 * 1000);
+		void (async () => {
+			const result = opts?.storedResult?.current;
+			const handoff = await resolveHandoffForCompletion(info, opts);
+			const wasAgentHandled = coordinator.consumeAgentHandledCompletion(id);
+			if (!wasAgentHandled) {
+				const duration = formatDuration(Date.now() - startTime);
+				const content = buildDispatchNotification(id, info, duration);
+				pi.sendMessage(
+					{
+						customType: "interactive-shell-transfer",
+						content,
+						display: true,
+						details: { sessionId: id, duration, ...info, ...result, ...handoff },
+					},
+					{ triggerTurn: true },
+				);
+				pi.events.emit("interactive-shell:transfer", { sessionId: id, ...info, ...result, ...handoff });
+			}
+			sessionManager.unregisterActive(id, false);
+			coordinator.deleteMonitor(id);
+			clearHandoffContext(id);
+			scheduleMonitorHistoryCleanup(id);
+			sessionManager.scheduleCleanup(id, 5 * 60 * 1000);
+		})().catch((error) => {
+			console.error("interactive-shell: monitor completion callback failed:", error);
+		});
 	};
 }
 
@@ -84,22 +360,22 @@ function resolveMonitorTerminalReason(info: HeadlessCompletionInfo, override?: M
 	return "script-failed";
 }
 
-function makeStructuredMonitorCompletionCallback(
-	pi: ExtensionAPI,
-	id: string,
-): (info: HeadlessCompletionInfo) => void {
+function makeStructuredMonitorCompletionCallback(pi: ExtensionAPI, id: string): (info: HeadlessCompletionInfo) => void {
 	return (info) => {
 		const reason = resolveMonitorTerminalReason(info, coordinator.consumePendingMonitorReason(id));
 		const state = coordinator.finalizeMonitorSession(id, { exitCode: info.exitCode, signal: info.signal }, reason);
 		const wasAgentHandled = coordinator.consumeAgentHandledCompletion(id);
 		if (!wasAgentHandled && state) {
 			const content = buildMonitorLifecycleNotification(state);
-			pi.sendMessage({
-				customType: "interactive-shell-monitor-lifecycle",
-				content,
-				display: true,
-				details: { sessionId: id, state, completion: info },
-			}, { triggerTurn: true });
+			pi.sendMessage(
+				{
+					customType: "interactive-shell-monitor-lifecycle",
+					content,
+					display: true,
+					details: { sessionId: id, state, completion: info },
+				},
+				{ triggerTurn: true },
+			);
 			pi.events.emit("interactive-shell:monitor-lifecycle", { sessionId: id, state, completion: info });
 		}
 		sessionManager.unregisterActive(id, false);
@@ -150,34 +426,39 @@ function shellQuote(value: string): string {
 
 function buildFileWatchCommand(fileWatch: Required<MonitorFileWatchConfig>): string {
 	const script = `
-const fs = require("node:fs");
-const watchPath = process.argv[1];
-const recursive = process.argv[2] === "1";
-const allowed = new Set((process.argv[3] || "rename,change").split(",").filter(Boolean));
-function emit(eventType, filename) {
-  if (!allowed.has(eventType)) return;
-  const name = filename ? String(filename) : ".";
-  process.stdout.write(eventType.toUpperCase() + " " + name + "\\n");
-}
-let watcher;
-try {
-  watcher = fs.watch(watchPath, { recursive }, (eventType, filename) => emit(eventType, filename));
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error("file-watch failed: " + message);
-  process.exit(1);
-}
-watcher.on("error", (error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error("file-watch error: " + message);
+import("node:fs").then((fs) => {
+  const watchPath = process.argv[1];
+  const recursive = process.argv[2] === "1";
+  const allowed = new Set((process.argv[3] || "rename,change").split(",").filter(Boolean));
+  function emit(eventType, filename) {
+    if (!allowed.has(eventType)) return;
+    const name = filename ? String(filename) : ".";
+    process.stdout.write(eventType.toUpperCase() + " " + name + "\\n");
+  }
+  let watcher;
+  try {
+    watcher = fs.watch(watchPath, { recursive }, (eventType, filename) => emit(eventType, filename));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("file-watch failed: " + message);
+    process.exit(1);
+  }
+  watcher.on("error", (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("file-watch error: " + message);
+    process.exit(1);
+  });
+  process.stdin.resume();
+}).catch((error) => {
+  console.error(error);
   process.exit(1);
 });
-process.stdin.resume();
 `.trim();
 
 	const encoded = Buffer.from(script, "utf8").toString("base64");
 	const eventCsv = fileWatch.events.join(",");
-	return `${shellQuote(process.execPath)} -e "eval(Buffer.from('${encoded}','base64').toString('utf8'))" ${shellQuote(fileWatch.path)} ${fileWatch.recursive ? "1" : "0"} ${shellQuote(eventCsv)}`;
+	// Plain node only: pi SEA rejects `-e` (treats the arg as an extension path).
+	return `${shellQuote(resolveNodeExecutable())} -e "eval(Buffer.from('${encoded}','base64').toString('utf8'))" ${shellQuote(fileWatch.path)} ${fileWatch.recursive ? "1" : "0"} ${shellQuote(eventCsv)}`;
 }
 
 function compareThreshold(value: number, op: MonitorThresholdOperator, expected: number): boolean {
@@ -214,9 +495,10 @@ function parseRegexPattern(value: string): { ok: true; regex: RegExp } | { ok: f
 	}
 }
 
-function compileMonitorTrigger(trigger: MonitorTriggerConfig, index: number):
-	| { ok: true; compiled: MonitorTriggerMatcher }
-	| { ok: false; error: string } {
+function compileMonitorTrigger(
+	trigger: MonitorTriggerConfig,
+	index: number,
+): { ok: true; compiled: MonitorTriggerMatcher } | { ok: false; error: string } {
 	const id = trigger.id?.trim();
 	if (!id) {
 		return { ok: false, error: `monitor.triggers[${index}] requires non-empty id.` };
@@ -290,9 +572,9 @@ function compileMonitorTrigger(trigger: MonitorTriggerConfig, index: number):
 	};
 }
 
-function compileMonitorConfig(raw: MonitorConfig | undefined):
-	| { ok: true; compiled: CompiledMonitorConfig }
-	| { ok: false; error: string } {
+function compileMonitorConfig(
+	raw: MonitorConfig | undefined,
+): { ok: true; compiled: CompiledMonitorConfig } | { ok: false; error: string } {
 	if (!raw) {
 		return { ok: false, error: "mode='monitor' requires monitor configuration." };
 	}
@@ -352,20 +634,16 @@ function compileMonitorConfig(raw: MonitorConfig | undefined):
 
 	const pollIntervalMs = Math.max(250, Math.trunc(raw.poll?.intervalMs ?? 5000));
 	const dedupeExactLine = raw.throttle?.dedupeExactLine !== false;
-	const cooldownMs = raw.throttle?.cooldownMs !== undefined
-		? Math.max(0, Math.trunc(raw.throttle.cooldownMs))
-		: undefined;
+	const cooldownMs = raw.throttle?.cooldownMs !== undefined ? Math.max(0, Math.trunc(raw.throttle.cooldownMs)) : undefined;
 	const stopAfterFirstEvent = raw.persistence?.stopAfterFirstEvent === true;
-	const maxEvents = raw.persistence?.maxEvents !== undefined
-		? Math.max(1, Math.trunc(raw.persistence.maxEvents))
-		: undefined;
+	const maxEvents = raw.persistence?.maxEvents !== undefined ? Math.max(1, Math.trunc(raw.persistence.maxEvents)) : undefined;
 
 	const detectorCommand = raw.detector?.detectorCommand?.trim();
 	const detector = detectorCommand
 		? {
-			detectorCommand,
-			timeoutMs: Math.max(100, Math.trunc(raw.detector?.timeoutMs ?? 3000)),
-		}
+				detectorCommand,
+				timeoutMs: Math.max(100, Math.trunc(raw.detector?.timeoutMs ?? 3000)),
+			}
 		: undefined;
 
 	const publicConfig: MonitorConfig = {
@@ -383,9 +661,9 @@ function compileMonitorConfig(raw: MonitorConfig | undefined):
 		},
 		detector: detector
 			? {
-				detectorCommand: detector.detectorCommand,
-				timeoutMs: detector.timeoutMs,
-			}
+					detectorCommand: detector.detectorCommand,
+					timeoutMs: detector.timeoutMs,
+				}
 			: undefined,
 	};
 
@@ -416,12 +694,8 @@ async function runDetectorCommand(
 	cwd?: string,
 ): Promise<DetectorDecision> {
 	return new Promise<DetectorDecision>((resolve, reject) => {
-		const shell = process.platform === "win32"
-			? (process.env.COMSPEC || "cmd.exe")
-			: (process.env.SHELL || "/bin/sh");
-		const args = process.platform === "win32"
-			? ["/d", "/s", "/c", detector.detectorCommand]
-			: ["-c", detector.detectorCommand];
+		const shell = process.platform === "win32" ? process.env.COMSPEC || "cmd.exe" : process.env.SHELL || "/bin/sh";
+		const args = process.platform === "win32" ? ["/d", "/s", "/c", detector.detectorCommand] : ["-c", detector.detectorCommand];
 
 		const child = spawnChildProcess(shell, args, {
 			cwd,
@@ -438,8 +712,12 @@ async function runDetectorCommand(
 
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
-		child.stdout.on("data", (chunk) => { stdout += chunk; });
-		child.stderr.on("data", (chunk) => { stderr += chunk; });
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk;
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk;
+		});
 
 		child.on("error", (error) => {
 			clearTimeout(timer);
@@ -491,61 +769,85 @@ function makeMonitorEventCallback(
 	let stopped = false;
 
 	return (event) => {
-		queue = queue.then(async () => {
-			if (stopped) return;
-			if (!coordinator.getMonitor(sessionId)) {
-				stopped = true;
-				return;
-			}
-
-			let candidate: Omit<MonitorEventPayload, "eventId" | "timestamp"> = {
-				sessionId,
-				strategy: event.strategy,
-				triggerId: event.triggerId,
-				eventType: event.eventType,
-				matchedText: event.matchedText,
-				lineOrDiff: event.lineOrDiff,
-				stream: event.stream,
-			};
-
-			if (config.detector) {
-				try {
-					const detectorPreview: MonitorEventPayload = {
-						...candidate,
-						eventId: 0,
-						timestamp: new Date().toISOString(),
-					};
-					const decision = await runDetectorCommand(config.detector, detectorPreview, cwd);
-					if (!decision.emit) return;
-					if (decision.triggerId) candidate = { ...candidate, triggerId: decision.triggerId };
-					if (decision.eventType) candidate = { ...candidate, eventType: decision.eventType };
-					if (decision.matchedText) candidate = { ...candidate, matchedText: decision.matchedText };
-					if (decision.lineOrDiff) candidate = { ...candidate, lineOrDiff: decision.lineOrDiff };
-				} catch (error) {
-					console.error(`interactive-shell: detectorCommand failed for ${sessionId}:`, error);
+		queue = queue
+			.then(async () => {
+				if (stopped) return;
+				if (!coordinator.getMonitor(sessionId)) {
+					stopped = true;
 					return;
 				}
-			}
 
-			const payload = coordinator.recordMonitorEvent(candidate);
-			const content = buildMonitorEventNotification(payload);
-			pi.sendMessage({
-				customType: "interactive-shell-monitor-event",
-				content,
-				display: true,
-				details: payload,
-			}, { triggerTurn: true });
-			pi.events.emit("interactive-shell:monitor-event", payload);
+				let candidate: Omit<MonitorEventPayload, "eventId" | "timestamp"> = {
+					sessionId,
+					strategy: event.strategy,
+					triggerId: event.triggerId,
+					eventType: event.eventType,
+					matchedText: event.matchedText,
+					lineOrDiff: event.lineOrDiff,
+					stream: event.stream,
+				};
 
-			emitted += 1;
-			if (config.persistence.stopAfterFirstEvent || (config.persistence.maxEvents !== undefined && emitted >= config.persistence.maxEvents)) {
-				stopped = true;
-				coordinator.markMonitorStopping(sessionId, "stopped");
-				sessionManager.getActive(sessionId)?.kill();
-			}
-		}).catch((error) => {
-			console.error(`interactive-shell: monitor callback queue error for ${sessionId}:`, error);
-		});
+				if (config.detector) {
+					try {
+						const detectorPreview: MonitorEventPayload = {
+							...candidate,
+							eventId: 0,
+							timestamp: new Date().toISOString(),
+						};
+						const decision = await runDetectorCommand(config.detector, detectorPreview, cwd);
+						if (!decision.emit) return;
+						if (decision.triggerId) candidate = { ...candidate, triggerId: decision.triggerId };
+						if (decision.eventType) candidate = { ...candidate, eventType: decision.eventType };
+						if (decision.matchedText) candidate = { ...candidate, matchedText: decision.matchedText };
+						if (decision.lineOrDiff) candidate = { ...candidate, lineOrDiff: decision.lineOrDiff };
+					} catch (error) {
+						console.error(`interactive-shell: detectorCommand failed for ${sessionId}:`, error);
+						return;
+					}
+				}
+
+				const payload = coordinator.recordMonitorEvent(candidate);
+				const content = buildMonitorEventNotification(payload);
+				pi.sendMessage(
+					{
+						customType: "interactive-shell-monitor-event",
+						content,
+						display: true,
+						details: payload,
+					},
+					{ triggerTurn: true },
+				);
+				pi.events.emit("interactive-shell:monitor-event", payload);
+
+				emitted += 1;
+				if (
+					config.persistence.stopAfterFirstEvent ||
+					(config.persistence.maxEvents !== undefined && emitted >= config.persistence.maxEvents)
+				) {
+					stopped = true;
+					coordinator.markMonitorStopping(sessionId, "stopped");
+					sessionManager.getActive(sessionId)?.kill();
+				}
+			})
+			.catch((error) => {
+				console.error(`interactive-shell: monitor callback queue error for ${sessionId}:`, error);
+			});
+	};
+}
+
+/** Shared write/sendKeys/paste/focus bindings for registered active sessions. */
+function sessionIoBindings(session: TerminalSession) {
+	return {
+		write: (data: string) => session.write(data),
+		sendKeys: (keys: string[]) => session.sendKeys?.(keys),
+		paste: (text: string) => session.paste?.(text),
+		writeAsync: session.writeAsync ? (data: string) => session.writeAsync!(data) : undefined,
+		sendKeysAsync: session.sendKeysAsync ? (keys: string[]) => session.sendKeysAsync!(keys) : undefined,
+		pasteAsync: session.pasteAsync ? (text: string) => session.pasteAsync!(text) : undefined,
+		sendInputSequence: session.sendInputSequence
+			? (options: { text?: string; paste?: string; keys?: string[]; submit?: boolean }) => session.sendInputSequence!(options)
+			: undefined,
+		focus: () => session.focus?.(),
 	};
 }
 
@@ -553,43 +855,391 @@ function registerHeadlessActive(
 	id: string,
 	command: string,
 	reason: string | undefined,
-	session: PtyTerminalSession,
+	session: TerminalSession,
 	monitor: HeadlessDispatchMonitor,
 	startTime: number,
 	config: InteractiveShellConfig,
 	status: "running" | "monitoring" = "running",
+	storedResult?: { current: ActiveSessionResult | undefined },
 ): void {
-	const queryState = createSessionQueryState();
+	// Share query state with attach / post-unregister sessionId fallback so incremental
+	// cursors survive the active → background-only transition after the first result poll.
+	const queryState = sessionManager.getQueryState(id);
 	coordinator.setMonitor(id, monitor);
-	const getCompletionOutput = () => monitor.getResult()?.completionOutput;
+	const getCompletionOutput = () => storedResult?.current?.completionOutput ?? monitor.getResult()?.completionOutput;
 
 	sessionManager.registerActive({
 		id,
 		command,
 		reason,
-		write: (data) => session.write(data),
+		...sessionIoBindings(session),
 		kill: () => {
 			const monitorState = coordinator.getMonitorSessionState(id);
 			if (monitorState?.status === "running") {
 				coordinator.markMonitorStopping(id, "stopped");
 			}
 			const liveMonitor = coordinator.getMonitor(id);
+			// Route through the monitor completion pipeline so storedResult / onComplete
+			// finalize; agent-handled markers suppress the user-facing completion turn.
 			if (liveMonitor && !liveMonitor.disposed) {
-				session.kill();
+				liveMonitor.cancel();
 				return;
 			}
+			session.kill();
 			coordinator.disposeMonitor(id);
 			scheduleMonitorHistoryCleanup(id);
 			sessionManager.remove(id);
 			sessionManager.unregisterActive(id, true);
 		},
+		// Kitty sessions already run as detached tabs.
 		background: () => {},
 		getOutput: (opts) => getSessionOutput(session, config, queryState, opts, getCompletionOutput()),
-		getStatus: () => session.exited ? "exited" : status,
+		getStatus: () => (session.exited ? "exited" : status),
 		getRuntime: () => Date.now() - startTime,
-		getResult: () => monitor.getResult(),
+		getResult: () => storedResult?.current ?? monitor.getResult(),
+		setQuietThreshold: (thresholdMs) => monitor.setQuietThreshold(thresholdMs),
 		onComplete: (cb) => monitor.registerCompleteCallback(cb),
 	});
+}
+
+/**
+ * Hands-free: agent-polled supervision (no dispatch completion turn).
+ * Uses HeadlessDispatchMonitor for timeout / autoExitOnQuiet; optional progress updates.
+ */
+function registerHandsFreeActive(
+	pi: ExtensionAPI,
+	id: string,
+	command: string,
+	reason: string | undefined,
+	session: TerminalSession,
+	monitor: HeadlessDispatchMonitor,
+	startTime: number,
+	config: InteractiveShellConfig,
+	options: {
+		updateMode: "on-quiet" | "interval";
+		updateInterval: number;
+		quietThreshold: number;
+		updateMaxChars: number;
+		maxTotalChars: number;
+		emitProgressUpdates: boolean;
+	},
+	storedResult: { current: ActiveSessionResult | undefined },
+): void {
+	const queryState = sessionManager.getQueryState(id);
+	coordinator.setMonitor(id, monitor);
+
+	let updateMode = options.updateMode;
+	let currentUpdateInterval = options.updateInterval;
+	let currentQuietThreshold = options.quietThreshold;
+	let totalCharsSent = 0;
+	let budgetExhausted = false;
+	let hasUnsentData = false;
+	let handsFreeInterval: ReturnType<typeof setInterval> | null = null;
+	let handsFreeInitialTimeout: ReturnType<typeof setTimeout> | null = null;
+	let progressQuietTimer: ReturnType<typeof setTimeout> | null = null;
+	let disposed = false;
+	let completed = false;
+	let unsubscribeProgressData: (() => void) | undefined;
+
+	const stopProgressTimers = () => {
+		if (handsFreeInitialTimeout) {
+			clearTimeout(handsFreeInitialTimeout);
+			handsFreeInitialTimeout = null;
+		}
+		if (handsFreeInterval) {
+			clearInterval(handsFreeInterval);
+			handsFreeInterval = null;
+		}
+		if (progressQuietTimer) {
+			clearTimeout(progressQuietTimer);
+			progressQuietTimer = null;
+		}
+		unsubscribeProgressData?.();
+		unsubscribeProgressData = undefined;
+	};
+
+	const emitProgress = (status: HandsFreeUpdate["status"] = "running", force = false) => {
+		if (!options.emitProgressUpdates || (disposed && !force)) return;
+		const maxChars = options.updateMaxChars;
+		const maxTotalChars = options.maxTotalChars;
+		let tail: string[] = [];
+		let truncated = false;
+		if (status === "running" && !budgetExhausted) {
+			let newOutput = session.getRawStream({ sinceLast: true, stripAnsi: true });
+			if (newOutput.length > maxChars) {
+				newOutput = newOutput.slice(-maxChars);
+				truncated = true;
+			}
+			if (totalCharsSent + newOutput.length > maxTotalChars) {
+				const remaining = maxTotalChars - totalCharsSent;
+				if (remaining > 0) {
+					newOutput = newOutput.slice(-remaining);
+					truncated = true;
+				} else {
+					newOutput = "";
+				}
+				budgetExhausted = true;
+			}
+			if (newOutput.length > 0) {
+				totalCharsSent += newOutput.length;
+				tail = newOutput.split("\n");
+			}
+		}
+		const update: HandsFreeUpdate = {
+			status,
+			sessionId: id,
+			runtime: Date.now() - startTime,
+			tail,
+			tailTruncated: truncated,
+			totalCharsSent,
+			budgetExhausted,
+		};
+		makeNonBlockingUpdateHandler(pi)(update);
+	};
+
+	const resetProgressQuietTimer = () => {
+		if (progressQuietTimer) {
+			clearTimeout(progressQuietTimer);
+			progressQuietTimer = null;
+		}
+		if (!options.emitProgressUpdates || updateMode !== "on-quiet" || disposed) return;
+		progressQuietTimer = setTimeout(() => {
+			progressQuietTimer = null;
+			if (disposed || !hasUnsentData) return;
+			emitProgress("running");
+			hasUnsentData = false;
+		}, currentQuietThreshold);
+	};
+
+	const tickProgressInterval = () => {
+		if (disposed) return;
+		if (updateMode === "on-quiet") {
+			if (hasUnsentData) {
+				emitProgress("running");
+				hasUnsentData = false;
+			}
+			return;
+		}
+		emitProgress("running");
+	};
+
+	if (options.emitProgressUpdates) {
+		unsubscribeProgressData = session.addDataListener((data) => {
+			const visible = data.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+			if (visible.trim().length > 0 && updateMode === "on-quiet") {
+				hasUnsentData = true;
+				resetProgressQuietTimer();
+			}
+		});
+		handsFreeInitialTimeout = setTimeout(() => {
+			handsFreeInitialTimeout = null;
+			if (!disposed) emitProgress("running");
+		}, 2000);
+		handsFreeInterval = setInterval(tickProgressInterval, currentUpdateInterval);
+	}
+
+	const completeHandsFree = () => {
+		if (completed) return;
+		completed = true;
+		stopProgressTimers();
+		const info = monitor.getResult();
+		if (hasUnsentData) {
+			emitProgress("running");
+			hasUnsentData = false;
+		}
+		emitProgress(info?.cancelled ? "killed" : "exited", true);
+		disposed = true;
+	};
+
+	monitor.registerCompleteCallback(completeHandsFree);
+
+	sessionManager.registerActive({
+		id,
+		command,
+		reason,
+		...sessionIoBindings(session),
+		kill: () => {
+			// cancel() finalizes asynchronously (output capture). completeHandsFree is
+			// registered as a monitor complete callback so it runs after cancelled is set.
+			// Calling it here would race getResult() and emit "exited" instead of "killed".
+			monitor.cancel();
+		},
+		// No-op: kitty sessions are already managed detached tabs.
+		background: () => {},
+		getOutput: (opts) =>
+			getSessionOutput(session, config, queryState, opts, storedResult.current?.completionOutput ?? monitor.getResult()?.completionOutput),
+		getStatus: () => {
+			const result = storedResult.current ?? monitor.getResult();
+			if (result?.cancelled) return "killed";
+			if (result || session.exited) return "exited";
+			return "running";
+		},
+		getRuntime: () => Date.now() - startTime,
+		getResult: () => storedResult.current ?? monitor.getResult(),
+		setUpdateInterval: (intervalMs) => {
+			const clamped = Math.max(5000, Math.min(300000, Math.trunc(intervalMs)));
+			if (clamped === currentUpdateInterval) return;
+			currentUpdateInterval = clamped;
+			if (handsFreeInterval) {
+				clearInterval(handsFreeInterval);
+				handsFreeInterval = setInterval(tickProgressInterval, currentUpdateInterval);
+			}
+		},
+		setQuietThreshold: (thresholdMs) => {
+			const clamped = Math.max(1000, Math.min(300000, Math.trunc(thresholdMs)));
+			currentQuietThreshold = clamped;
+			monitor.setQuietThreshold(clamped);
+			if (progressQuietTimer) resetProgressQuietTimer();
+		},
+		onComplete: (cb) => monitor.registerCompleteCallback(cb),
+	});
+}
+
+function registerRunningActive(
+	id: string,
+	command: string,
+	reason: string | undefined,
+	session: TerminalSession,
+	startTime: number,
+	config: InteractiveShellConfig,
+	onComplete: () => void,
+	storedResult?: { current: ActiveSessionResult | undefined },
+): void {
+	const queryState = sessionManager.getQueryState(id);
+	sessionManager.registerActive({
+		id,
+		command,
+		reason,
+		...sessionIoBindings(session),
+		kill: () => {
+			session.kill();
+		},
+		// No-op: kitty sessions are already managed detached tabs.
+		background: () => {},
+		getOutput: (opts) => getSessionOutput(session, config, queryState, opts, storedResult?.current?.completionOutput),
+		getStatus: () => {
+			const result = storedResult?.current;
+			if (result?.cancelled) return "killed";
+			if (result?.timedOut || result || session.exited) return "exited";
+			return "running";
+		},
+		getRuntime: () => Date.now() - startTime,
+		getResult: () => {
+			if (storedResult?.current) return storedResult.current;
+			if (session.exited) {
+				return {
+					exitCode: session.exitCode,
+					signal: session.signal,
+					backgrounded: false,
+					cancelled: false,
+				};
+			}
+			return undefined;
+		},
+		onComplete: (cb) => session.addExitListener(() => cb()),
+	});
+	session.addExitListener(() => {
+		onComplete();
+	});
+}
+
+function sessionTitle(config: InteractiveShellConfig, sessionId: string): string {
+	return `${config.kitty?.tabTitlePrefix ?? "pi-shell"}: ${sessionId}`;
+}
+
+async function sendStructuredInput(
+	session: ReturnType<typeof sessionManager.getActive>,
+	sessionId: string,
+	input: string | { text?: string; keys?: string[]; paste?: string; hex?: string[] } | undefined,
+	submit?: boolean,
+): Promise<boolean> {
+	if (!session) return false;
+	const hasNativeInput =
+		typeof session.write === "function" || typeof session.sendKeys === "function" || typeof session.paste === "function";
+	if (!hasNativeInput) {
+		const translated = input !== undefined ? translateInput(input) : "";
+		return sessionManager.writeToActive(sessionId, submit ? `${translated}\r` : translated);
+	}
+	const write =
+		typeof session.write === "function"
+			? async (data: string) => {
+					if (typeof session.writeAsync === "function") {
+						await session.writeAsync(data);
+					} else {
+						session.write(data);
+					}
+					return true;
+				}
+			: (data: string) => sessionManager.writeToActive(sessionId, data);
+	try {
+		if (input === undefined) {
+			await write(submit ? "\r" : "");
+			return true;
+		}
+		if (typeof input === "string") {
+			await write(submit ? `${input}\r` : input);
+			return true;
+		}
+		let raw = "";
+		if (input.hex?.length) {
+			raw += translateInput({ hex: input.hex });
+		}
+		if (input.text) {
+			raw += input.text;
+		}
+		// Prefer a single ordered RC batch (paste + keys + Enter on one socket) so kitty
+		// cannot process submit before paste when connections are independent.
+		if (typeof session.sendInputSequence === "function") {
+			await session.sendInputSequence({
+				text: raw || undefined,
+				paste: input.paste,
+				keys: input.keys,
+				submit,
+			});
+			return true;
+		}
+		if (raw) {
+			// Keep submit on the text path when possible (same as plain-string input).
+			const trailingKeys = input.keys ?? [];
+			const submitViaText = Boolean(submit) && trailingKeys.length === 0 && !input.paste;
+			await write(submitViaText ? `${raw}\r` : raw);
+			if (submitViaText) return true;
+		}
+		if (input.paste) {
+			const trailingKeys = input.keys ?? [];
+			const submitViaText = Boolean(submit) && trailingKeys.length === 0;
+			if (typeof session.pasteAsync === "function") {
+				await session.pasteAsync(input.paste);
+			} else if (typeof session.paste === "function") {
+				session.paste(input.paste);
+			} else {
+				await write(translateInput({ paste: input.paste }));
+			}
+			// Fall back to text-path CR rather than a separate send-key when no other keys.
+			if (submitViaText) {
+				await write("\r");
+				return true;
+			}
+		}
+		const keys = [...(input.keys ?? [])];
+		if (submit) keys.push("enter");
+		if (keys.length > 0) {
+			if (typeof session.sendKeysAsync === "function") {
+				await session.sendKeysAsync(keys);
+			} else if (typeof session.sendKeys === "function") {
+				session.sendKeys(keys);
+			} else {
+				await write(translateInput({ keys }));
+			}
+		} else if (submit && !raw && !input.paste) {
+			await write("\r");
+		}
+		return true;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`interactive-shell: failed to send input to session ${sessionId}:`, message);
+		return false;
+	}
 }
 
 function makeNonBlockingUpdateHandler(pi: ExtensionAPI): (update: HandsFreeUpdate) => void {
@@ -597,46 +1247,16 @@ function makeNonBlockingUpdateHandler(pi: ExtensionAPI): (update: HandsFreeUpdat
 		pi.events.emit("interactive-shell:update", update);
 		const message = buildHandsFreeUpdateMessage(update);
 		if (!message) return;
-		pi.sendMessage({
-			customType: "interactive-shell-update",
-			content: message.content,
-			display: true,
-			details: message.details,
-		}, { triggerTurn: true });
+		pi.sendMessage(
+			{
+				customType: "interactive-shell-update",
+				content: message.content,
+				display: true,
+				details: message.details,
+			},
+			{ triggerTurn: true },
+		);
 	};
-}
-
-function emitTransferredOutput(
-	pi: ExtensionAPI,
-	result: InteractiveShellResult,
-	fallbackSessionId?: string,
-): void {
-	if (!result.transferred) return;
-	const sessionId = result.sessionId ?? fallbackSessionId;
-	const truncatedNote = result.transferred.truncated
-		? ` (truncated from ${result.transferred.totalLines} total lines)`
-		: "";
-	const prefix = sessionId
-		? `Session ${sessionId} output transferred`
-		: "Interactive shell output transferred";
-	const content = `${prefix} (${result.transferred.lines.length} lines${truncatedNote}):\n\n${result.transferred.lines.join("\n")}`;
-	pi.sendMessage({
-		customType: "interactive-shell-transfer",
-		content,
-		display: true,
-		details: {
-			sessionId,
-			transferred: result.transferred,
-			exitCode: result.exitCode,
-			signal: result.signal,
-		},
-	}, { triggerTurn: true });
-	pi.events.emit("interactive-shell:transfer", {
-		sessionId,
-		transferred: result.transferred,
-		exitCode: result.exitCode,
-		signal: result.signal,
-	});
 }
 
 function appendWorktreeNotice(text: string, worktreePath: string | undefined): string {
@@ -644,9 +1264,186 @@ function appendWorktreeNotice(text: string, worktreePath: string | undefined): s
 	return `${text}\nWorktree left in place: ${worktreePath}`;
 }
 
+/**
+ * Resolve a sessionId against the active table first, then background.
+ * After the first completed-status poll unregisters active (agent-poll semantics),
+ * subsequent sessionId / incremental / drain queries must still reach the kitty tab
+ * via the background entry (P-1).
+ *
+ * When active is present, background is **peeked** (no timer suspend). Calling
+ * `get()` here would clear a hands-free/dispatch 5-minute cleanup armed at
+ * completion, and the completed-active path used to return without re-arming it.
+ * Background-only lookups still use `get()` so attach/query suspends cleanup for
+ * the duration of the tool call (callers restart via maybeRestartBackgroundCleanup).
+ */
+function resolveSessionById(sessionId: string): {
+	active: ActiveSession | undefined;
+	background: BackgroundSession | undefined;
+} {
+	const active = sessionManager.getActive(sessionId);
+	if (active) {
+		return { active, background: sessionManager.peekBackground(sessionId) };
+	}
+	const background = sessionManager.hasBackground(sessionId) ? sessionManager.get(sessionId) : undefined;
+	return { active: undefined, background };
+}
+
+/** Keep background session expiry armed after active is dropped on completed polls. */
+function ensureBackgroundExpiry(sessionId: string, delayMs = 5 * 60 * 1000): void {
+	// scheduleCleanup is idempotent when a timer is already pending.
+	sessionManager.scheduleCleanup(sessionId, delayMs);
+}
+
+/** After background reads, resume delayed cleanup when no headless monitor owns the session. */
+function maybeRestartBackgroundCleanup(sessionId: string): void {
+	const monitor = coordinator.getMonitor(sessionId);
+	if (!monitor || monitor.disposed) {
+		sessionManager.restartAutoCleanup(sessionId);
+	}
+}
+
+function persistBackgroundResult(sessionId: string, result: ActiveSessionResult): void {
+	sessionManager.setBackgroundResult(sessionId, result);
+}
+
+function statusFromBackground(bg: BackgroundSession): string {
+	const result = bg.lastResult;
+	if (result?.cancelled) return "killed";
+	if (result?.timedOut) return "exited";
+	if (result || bg.session.exited) return "exited";
+	return "running";
+}
+
+async function queryBackgroundSessionOutput(
+	sessionId: string,
+	bg: BackgroundSession,
+	ctxCwd: string,
+	opts: {
+		outputLines?: number;
+		outputMaxChars?: number;
+		outputOffset?: number;
+		drain?: boolean;
+		incremental?: boolean;
+		skipRateLimit?: boolean;
+	},
+): Promise<{
+	status: string;
+	runtime: number;
+	output: string;
+	truncated: boolean;
+	totalBytes: number;
+	totalLines?: number;
+	hasMore?: boolean;
+	lastResult?: ActiveSessionResult;
+}> {
+	const config = loadConfig(ctxCwd);
+	const queryState = sessionManager.getQueryState(sessionId);
+	const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(
+		bg.session,
+		config,
+		queryState,
+		{
+			skipRateLimit: opts.skipRateLimit ?? true,
+			lines: opts.outputLines,
+			maxChars: opts.outputMaxChars,
+			offset: opts.outputOffset,
+			drain: opts.drain,
+			incremental: opts.incremental,
+		},
+		// Default tail can reuse the exit-time snapshot; incremental/drain/offset need live/log paths.
+		bg.lastResult?.completionOutput,
+	);
+	maybeRestartBackgroundCleanup(sessionId);
+	return {
+		status: statusFromBackground(bg),
+		runtime: Date.now() - bg.startedAt.getTime(),
+		output,
+		truncated,
+		totalBytes,
+		totalLines,
+		hasMore,
+		lastResult: bg.lastResult,
+	};
+}
+
+/**
+ * After attach, re-register a lightweight active handle when the kitty session is still
+ * running so sessionId settings/input keep working (main reattach re-opened an overlay).
+ * Always read completion from background.lastResult / live monitor so post-completion
+ * polls stay consistent after rehydrate.
+ */
+function rehydrateActiveFromBackground(sessionId: string, config: InteractiveShellConfig): void {
+	if (sessionManager.getActive(sessionId)) return;
+	if (!sessionManager.hasBackground(sessionId)) return;
+	const bg = sessionManager.get(sessionId);
+	if (!bg || bg.session.exited) return;
+
+	const monitor = coordinator.getMonitor(sessionId);
+	const startTime = bg.startedAt.getTime();
+	const queryState = sessionManager.getQueryState(sessionId);
+	const liveMonitor = () => {
+		const current = coordinator.getMonitor(sessionId);
+		return current && !current.disposed ? current : undefined;
+	};
+
+	sessionManager.registerActive({
+		id: sessionId,
+		command: bg.command,
+		reason: bg.reason,
+		...sessionIoBindings(bg.session),
+		kill: () => {
+			const mon = liveMonitor();
+			if (mon) {
+				mon.cancel();
+				return;
+			}
+			bg.session.kill();
+		},
+		background: () => {},
+		getOutput: (opts) =>
+			getSessionOutput(
+				bg.session,
+				config,
+				queryState,
+				opts,
+				bg.lastResult?.completionOutput ?? liveMonitor()?.getResult()?.completionOutput,
+			),
+		getStatus: () => {
+			if (bg.lastResult?.cancelled) return "killed";
+			if (bg.lastResult || bg.session.exited) return "exited";
+			const monState = coordinator.getMonitorSessionState(sessionId);
+			if (monState?.status === "running") return "monitoring";
+			return "running";
+		},
+		getRuntime: () => Date.now() - startTime,
+		getResult: () => {
+			if (bg.lastResult) return bg.lastResult;
+			const info = liveMonitor()?.getResult();
+			if (!info) return undefined;
+			return {
+				exitCode: info.exitCode,
+				signal: info.signal,
+				timedOut: info.timedOut,
+				cancelled: info.cancelled,
+				completionOutput: info.completionOutput,
+			};
+		},
+		setQuietThreshold: (thresholdMs) => {
+			liveMonitor()?.setQuietThreshold(thresholdMs);
+		},
+		onComplete: (cb) => {
+			const mon = liveMonitor();
+			if (mon) {
+				mon.registerCompleteCallback(cb);
+				return;
+			}
+			bg.session.addExitListener(() => cb());
+		},
+	});
+}
+
 export default function interactiveShellExtension(pi: ExtensionAPI) {
 	const startupConfig = loadConfig(process.cwd());
-	let terminalInputCleanup: (() => void) | null = null;
 	const loadRuntimeConfig = (cwd: string): InteractiveShellConfig => {
 		const config = loadConfig(cwd);
 		return {
@@ -664,26 +1461,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 		coordinator.clearMonitorEvents(id);
 		sessionManager.unregisterActive(id, false);
 	};
-	const createOverlayUiOptions = (config: InteractiveShellConfig) => ({
-		overlay: true,
-		overlayOptions: {
-			width: `${config.overlayWidthPercent}%`,
-			maxHeight: `${config.overlayHeightPercent}%`,
-			anchor: "center",
-			margin: 1,
-			nonCapturing: true,
-		},
-		onHandle: (handle) => {
-			coordinator.setOverlayHandle(handle);
-			handle.focus();
-		},
-	});
-	const spawnOverlay = async (ctx: ExtensionContext, request?: SpawnRequest): Promise<void> => {
-		if (coordinator.isOverlayOpen()) {
-			ctx.ui.notify("An overlay is already open. Close it first.", "error");
-			return;
-		}
-
+	const spawnKittySession = async (ctx: ExtensionContext, request?: SpawnRequest): Promise<void> => {
 		const config = loadRuntimeConfig(ctx.cwd);
 		const spawn = resolveSpawn(config, ctx.cwd, request, () => ctx.sessionManager.getSessionFile());
 		if (!spawn.ok) {
@@ -691,27 +1469,18 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (!coordinator.beginOverlay()) {
-			ctx.ui.notify(appendWorktreeNotice("An overlay is already open. Close it first.", spawn.spawn.worktreePath), "error");
-			return;
+		const result = await startNewSession({
+			ctx,
+			command: spawn.spawn.command,
+			cwd: spawn.spawn.cwd,
+			reason: spawn.spawn.reason,
+			mode: "interactive",
+		});
+		if (spawn.spawn.worktreePath) {
+			ctx.ui.notify(`Worktree left in place: ${spawn.spawn.worktreePath}`, "info");
 		}
-		try {
-			const result = await ctx.ui.custom<InteractiveShellResult>(
-				(tui, theme, _kb, done) =>
-					new InteractiveShellOverlay(tui, theme, {
-						command: spawn.spawn.command,
-						cwd: spawn.spawn.cwd,
-						reason: spawn.spawn.reason,
-						onUnfocus: () => coordinator.unfocusOverlay(),
-					}, config, done),
-				createOverlayUiOptions(config),
-			);
-			if (spawn.spawn.worktreePath) {
-				ctx.ui.notify(`Worktree left in place: ${spawn.spawn.worktreePath}`, "info");
-			}
-			emitTransferredOutput(pi, result);
-		} finally {
-			coordinator.endOverlay();
+		if (result.isError) {
+			ctx.ui.notify(result.content[0]?.text ?? "Failed to start session.", "error");
 		}
 	};
 	const startNewSession = async (params: {
@@ -728,9 +1497,36 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 		handoffSnapshot?: ToolParams["handoffSnapshot"];
 		timeout?: number;
 		monitor?: ToolParams["monitor"];
+		signal?: AbortSignal;
 		onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }) => void;
+		input?: ToolParams["input"];
+		inputKeys?: ToolParams["inputKeys"];
+		inputHex?: ToolParams["inputHex"];
+		inputPaste?: ToolParams["inputPaste"];
+		submit?: ToolParams["submit"];
 	}): Promise<{ content: Array<{ type: "text"; text: string }>; details?: any; isError?: boolean }> => {
-		const { ctx, command, spawn, cwd, name, reason, mode, background, handsFree, handoffPreview, handoffSnapshot, timeout, monitor, onUpdate } = params;
+		const {
+			ctx,
+			command,
+			spawn,
+			cwd,
+			name,
+			reason,
+			mode,
+			background,
+			handsFree,
+			handoffPreview,
+			handoffSnapshot,
+			timeout,
+			monitor,
+			signal,
+			onUpdate,
+			input,
+			inputKeys,
+			inputHex,
+			inputPaste,
+			submit,
+		} = params;
 		const allowsGeneratedCommand = mode === "monitor" && monitor?.strategy === "file-watch";
 		if (!command && !spawn && !allowsGeneratedCommand) {
 			return {
@@ -742,29 +1538,15 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 		let effectiveCwd = cwd ?? ctx.cwd;
 		const config = loadRuntimeConfig(effectiveCwd);
 		const isMonitorMode = mode === "monitor";
-		const isNonBlocking = mode === "hands-free" || mode === "dispatch" || isMonitorMode;
-		const hasUI = ctx.hasUI !== false;
+		const handoffOpts = handoffOverridesFromParams(handoffPreview, handoffSnapshot);
+		const hasStructuredInput = inputKeys?.length || inputHex?.length || inputPaste;
+		const effectiveInput = hasStructuredInput ? { text: input, keys: inputKeys, hex: inputHex, paste: inputPaste } : input;
 
 		if (background && mode !== "dispatch" && mode !== "monitor") {
 			return {
 				content: [{ type: "text", text: "background: true requires mode='dispatch' or mode='monitor' for new sessions." }],
 				isError: true,
 			};
-		}
-		if (!isMonitorMode && !(mode === "dispatch" && background)) {
-			if (!hasUI) {
-				return {
-					content: [{ type: "text", text: "Interactive shell requires interactive TUI mode" }],
-					isError: true,
-				};
-			}
-			if (coordinator.isOverlayOpen()) {
-				return {
-					content: [{ type: "text", text: "An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one." }],
-					isError: true,
-					details: { error: "overlay_already_open" },
-				};
-			}
 		}
 
 		let effectiveCommand = command;
@@ -782,9 +1564,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			}
 			effectiveCommand = resolvedSpawn.spawn.command;
 			effectiveCwd = resolvedSpawn.spawn.cwd;
-			effectiveReason = effectiveReason
-				? `${effectiveReason} • ${resolvedSpawn.spawn.reason}`
-				: resolvedSpawn.spawn.reason;
+			effectiveReason = effectiveReason ? `${effectiveReason} • ${resolvedSpawn.spawn.reason}` : resolvedSpawn.spawn.reason;
 			spawnWorktreePath = resolvedSpawn.spawn.worktreePath;
 			spawnAgent = resolvedSpawn.spawn.agent;
 			spawnMode = resolvedSpawn.spawn.mode;
@@ -797,6 +1577,33 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			};
 		}
 
+		const launchSession = async (
+			sessionId: string,
+			commandToRun: string,
+			focus: boolean,
+		): Promise<{ ok: true; session: KittyTerminalSession } | { ok: false; error: string }> => {
+			try {
+				const session = new KittyTerminalSession(
+					{
+						id: sessionId,
+						command: commandToRun,
+						cwd: effectiveCwd,
+						cols: 120,
+						rows: 40,
+						scrollback: config.scrollbackLines,
+						focus,
+						title: sessionTitle(config, sessionId),
+					},
+					config,
+				);
+				await session.ready;
+				return { ok: true, session };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, error: `Failed to launch kitty session: ${message}` };
+			}
+		};
+
 		if (isMonitorMode) {
 			const compiledMonitor = compileMonitorConfig(monitor);
 			if (!compiledMonitor.ok) {
@@ -807,263 +1614,402 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			}
 
 			const id = generateSessionId(name);
-			const sessionCommand = compiledMonitor.compiled.runtime.strategy === "file-watch"
-				? `file-watch ${compiledMonitor.compiled.fileWatch?.path ?? "<unknown>"}`
-				: effectiveCommand!;
-			const monitorCommand = compiledMonitor.compiled.runtime.strategy === "poll-diff"
-				? buildPollDiffLoopCommand(sessionCommand, compiledMonitor.compiled.runtime.pollIntervalMs)
-				: compiledMonitor.compiled.runtime.strategy === "file-watch"
-					? buildFileWatchCommand(compiledMonitor.compiled.fileWatch!)
-					: sessionCommand;
-			const session = new PtyTerminalSession(
-				{ command: monitorCommand, cwd: effectiveCwd, cols: 120, rows: 40, scrollback: config.scrollbackLines },
-			);
+			const strategy = compiledMonitor.compiled.runtime.strategy;
+			const sessionCommand =
+				strategy === "file-watch" ? `file-watch ${compiledMonitor.compiled.fileWatch?.path ?? "<unknown>"}` : effectiveCommand!;
+			let monitorCommand = sessionCommand;
+			if (strategy === "poll-diff") {
+				monitorCommand = buildPollDiffLoopCommand(sessionCommand, compiledMonitor.compiled.runtime.pollIntervalMs);
+			} else if (strategy === "file-watch") {
+				monitorCommand = buildFileWatchCommand(compiledMonitor.compiled.fileWatch!);
+			}
 			const startTime = Date.now();
+			const launched = await launchSession(id, monitorCommand, background !== true);
+			if (!launched.ok) {
+				releaseSessionId(id);
+				return {
+					content: [{ type: "text", text: appendWorktreeNotice(launched.error, spawnWorktreePath) }],
+					isError: true,
+					details: { error: "kitty_launch_failed", spawnAgent, spawnMode, spawnWorktreePath },
+				};
+			}
+			const session = launched.session;
 			sessionManager.add(sessionCommand, session, name, effectiveReason, { id, noAutoCleanup: true, startedAt: new Date(startTime) });
 
 			coordinator.registerMonitorSession(id, compiledMonitor.compiled.publicConfig, new Date(startTime));
-			const monitorRunner = new HeadlessDispatchMonitor(session, config, {
-				autoExitOnQuiet: handsFree?.autoExitOnQuiet === true,
-				quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
-				gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-				timeout,
-				startedAt: startTime,
-				monitor: compiledMonitor.compiled.runtime,
-				onMonitorEvent: makeMonitorEventCallback(pi, id, compiledMonitor.compiled, effectiveCwd),
-			}, makeStructuredMonitorCompletionCallback(pi, id));
+			const monitorRunner = new HeadlessDispatchMonitor(
+				session,
+				config,
+				{
+					autoExitOnQuiet: handsFree?.autoExitOnQuiet === true,
+					quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
+					gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+					timeout,
+					startedAt: startTime,
+					monitor: compiledMonitor.compiled.runtime,
+					onMonitorEvent: makeMonitorEventCallback(pi, id, compiledMonitor.compiled, effectiveCwd),
+				},
+				makeStructuredMonitorCompletionCallback(pi, id),
+			);
 			registerHeadlessActive(id, sessionCommand, effectiveReason, session, monitorRunner, startTime, config, "monitoring");
 
 			return {
-				content: [{ type: "text", text: appendWorktreeNotice(`Monitor started in background (id: ${id}).\nStrategy: ${compiledMonitor.compiled.publicConfig.strategy ?? "stream"}\nTriggers: ${compiledMonitor.compiled.publicConfig.triggers.map((trigger) => trigger.id).join(", ")}\nYou'll be notified when a trigger emits an event.`, spawnWorktreePath) }],
-				details: { sessionId: id, backgroundId: id, mode: "monitor", monitor: compiledMonitor.compiled.publicConfig, background: true, spawnAgent, spawnMode, spawnWorktreePath },
+				content: [
+					{
+						type: "text",
+						text: appendWorktreeNotice(
+							`Monitor started in background (id: ${id}).\nStrategy: ${compiledMonitor.compiled.publicConfig.strategy ?? "stream"}\nTriggers: ${compiledMonitor.compiled.publicConfig.triggers.map((trigger) => trigger.id).join(", ")}\nYou'll be notified when a trigger emits an event.`,
+							spawnWorktreePath,
+						),
+					},
+				],
+				details: {
+					sessionId: id,
+					backgroundId: id,
+					mode: "monitor",
+					monitor: compiledMonitor.compiled.publicConfig,
+					background: true,
+					spawnAgent,
+					spawnMode,
+					spawnWorktreePath,
+				},
 			};
 		}
 
-		if (mode === "dispatch" && background) {
-			const id = generateSessionId(name);
-			const session = new PtyTerminalSession(
-				{ command: effectiveCommand, cwd: effectiveCwd, cols: 120, rows: 40, scrollback: config.scrollbackLines },
-			);
-
-			const startTime = Date.now();
-			sessionManager.add(effectiveCommand, session, name, effectiveReason, { id, noAutoCleanup: true, startedAt: new Date(startTime) });
-
-			const monitor = new HeadlessDispatchMonitor(session, config, {
-				autoExitOnQuiet: handsFree?.autoExitOnQuiet !== false,
-				quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
-				gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-				timeout,
-				startedAt: startTime,
-			}, makeMonitorCompletionCallback(pi, id, startTime));
-			registerHeadlessActive(id, effectiveCommand, effectiveReason, session, monitor, startTime, config);
-
+		const sessionId = generateSessionId(name);
+		const startTime = Date.now();
+		const launched = await launchSession(sessionId, effectiveCommand!, background !== true);
+		if (!launched.ok) {
+			releaseSessionId(sessionId);
 			return {
-				content: [{ type: "text", text: appendWorktreeNotice(`Session dispatched in background (id: ${id}).\nYou'll be notified when it completes. User can /attach ${id} to watch.`, spawnWorktreePath) }],
-				details: { sessionId: id, backgroundId: id, mode: "dispatch", background: true, spawnAgent, spawnMode, spawnWorktreePath },
+				content: [{ type: "text", text: appendWorktreeNotice(launched.error, spawnWorktreePath) }],
+				isError: true,
+				details: { error: "kitty_launch_failed", spawnAgent, spawnMode, spawnWorktreePath },
 			};
 		}
+		const session = launched.session;
+		const handoffContext = { command: effectiveCommand!, cwd: effectiveCwd };
+		registerHandoffContext(sessionId, session, config, handoffContext, handoffOpts);
 
-		const generatedSessionId = isNonBlocking ? generateSessionId(name) : undefined;
-		if (isNonBlocking && generatedSessionId) {
-			if (!coordinator.beginOverlay()) {
-				return {
-					content: [{ type: "text", text: appendWorktreeNotice("An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one.", spawnWorktreePath) }],
-					isError: true,
-					details: { error: "overlay_already_open", spawnAgent, spawnMode, spawnWorktreePath },
-				};
-			}
-			const overlayStartTime = Date.now();
+		// Send initial input (if any) to the freshly launched session before entering
+		// mode-specific supervision. writeAsync/sendKeysAsync await this.ready so the
+		// input lands once the tab is up; previously this was silently dropped for new
+		// sessions (only the existing-session branch sent input).
+		if (effectiveInput !== undefined || submit) {
+			await sendStructuredInput(session, sessionId, effectiveInput, submit);
+		}
 
-			let overlayPromise: Promise<InteractiveShellResult>;
-			try {
-				overlayPromise = ctx.ui.custom<InteractiveShellResult>(
-					(tui, theme, _kb, done) =>
-						new InteractiveShellOverlay(tui, theme, {
+		if (mode === "dispatch" || background) {
+			sessionManager.add(effectiveCommand, session, name, effectiveReason, {
+				id: sessionId,
+				noAutoCleanup: true,
+				startedAt: new Date(startTime),
+			});
+			const storedResult: { current: ActiveSessionResult | undefined } = { current: undefined };
+			const monitor = new HeadlessDispatchMonitor(
+				session,
+				config,
+				{
+					autoExitOnQuiet: handsFree?.autoExitOnQuiet !== false,
+					quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
+					gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+					timeout,
+					startedAt: startTime,
+				},
+				(info) => {
+					void (async () => {
+						const artifacts = await buildHandoffArtifacts(session, handoffWhenFromCompletion(info), config, handoffContext, handoffOpts);
+						storedResult.current = {
+							exitCode: info.exitCode,
+							signal: info.signal,
+							backgrounded: false,
+							timedOut: info.timedOut,
+							cancelled: info.cancelled ?? false,
+							completionOutput: info.completionOutput,
+							...artifacts,
+						};
+						persistBackgroundResult(sessionId, storedResult.current);
+						makeMonitorCompletionCallback(pi, sessionId, startTime, {
+							session,
+							config,
 							command: effectiveCommand,
 							cwd: effectiveCwd,
-							name,
-							reason: effectiveReason,
-							mode,
-							sessionId: generatedSessionId,
-							startedAt: overlayStartTime,
-							handsFreeUpdateMode: handsFree?.updateMode,
-							handsFreeUpdateInterval: handsFree?.updateInterval,
-							handsFreeQuietThreshold: handsFree?.quietThreshold,
-							handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
-							handsFreeMaxTotalChars: handsFree?.maxTotalChars,
-							autoExitOnQuiet: mode === "dispatch"
-								? handsFree?.autoExitOnQuiet !== false
-								: handsFree?.autoExitOnQuiet === true,
-							autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-							onUnfocus: () => coordinator.unfocusOverlay(),
-							onHandsFreeUpdate: mode === "hands-free"
-								? makeNonBlockingUpdateHandler(pi)
-								: undefined,
-							handoffPreviewEnabled: handoffPreview?.enabled,
-							handoffPreviewLines: handoffPreview?.lines,
-							handoffPreviewMaxChars: handoffPreview?.maxChars,
-							handoffSnapshotEnabled: handoffSnapshot?.enabled,
-							handoffSnapshotLines: handoffSnapshot?.lines,
-							handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
-							timeout,
-						}, config, done),
-					createOverlayUiOptions(config),
-				);
-			} catch (error) {
-				coordinator.endOverlay();
-				throw error;
-			}
-
-			setupDispatchCompletion(pi, overlayPromise, config, {
-				id: generatedSessionId,
-				mode,
-				command: effectiveCommand,
-				reason: effectiveReason,
-				timeout,
-				handsFree,
-				overlayStartTime,
-			});
-
-			if (mode === "dispatch") {
-				return {
-					content: [{ type: "text", text: appendWorktreeNotice(`Session dispatched (id: ${generatedSessionId}).\nYou'll be notified when it completes.\nYou can still query with interactive_shell({ sessionId: "${generatedSessionId}" }) if needed.`, spawnWorktreePath) }],
-					details: { sessionId: generatedSessionId, status: "running", command: effectiveCommand, reason: effectiveReason, mode, spawnAgent, spawnMode, spawnWorktreePath },
-				};
-			}
-			return {
-				content: [{ type: "text", text: appendWorktreeNotice(`Session started: ${generatedSessionId}\nCommand: ${effectiveCommand}\n\nUse interactive_shell({ sessionId: "${generatedSessionId}" }) to check status/output.\nUse interactive_shell({ sessionId: "${generatedSessionId}", kill: true }) to end when done.`, spawnWorktreePath) }],
-				details: { sessionId: generatedSessionId, status: "running", command: effectiveCommand, reason: effectiveReason, spawnAgent, spawnMode, spawnWorktreePath },
-			};
-		}
-
-		if (!coordinator.beginOverlay()) {
-			return {
-				content: [{ type: "text", text: appendWorktreeNotice("An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one.", spawnWorktreePath) }],
-				isError: true,
-				details: { error: "overlay_already_open", spawnAgent, spawnMode, spawnWorktreePath },
-			};
-		}
-		onUpdate?.({
-			content: [{ type: "text", text: appendWorktreeNotice(`Opening: ${effectiveCommand}`, spawnWorktreePath) }],
-			details: { exitCode: null, backgrounded: false, cancelled: false },
-		});
-
-		let result: InteractiveShellResult;
-		try {
-			result = await ctx.ui.custom<InteractiveShellResult>(
-				(tui, theme, _kb, done) =>
-					new InteractiveShellOverlay(tui, theme, {
-						command: effectiveCommand,
-						cwd: effectiveCwd,
-						name,
-						reason: effectiveReason,
-						mode,
-						sessionId: generatedSessionId,
-						handsFreeUpdateMode: handsFree?.updateMode,
-						handsFreeUpdateInterval: handsFree?.updateInterval,
-						handsFreeQuietThreshold: handsFree?.quietThreshold,
-						handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
-						handsFreeMaxTotalChars: handsFree?.maxTotalChars,
-						autoExitOnQuiet: handsFree?.autoExitOnQuiet,
-						autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-						onUnfocus: () => coordinator.unfocusOverlay(),
-						streamingMode: mode === "hands-free",
-						onHandsFreeUpdate: mode === "hands-free"
-							? (update) => {
-								let statusText: string;
-								switch (update.status) {
-									case "user-takeover":
-										statusText = `User took over session ${update.sessionId}`;
-										break;
-									case "agent-resumed":
-										statusText = `Agent resumed monitoring session ${update.sessionId}`;
-										break;
-									case "exited":
-										statusText = `Session ${update.sessionId} exited`;
-										break;
-									case "killed":
-										statusText = `Session ${update.sessionId} killed`;
-										break;
-									default: {
-										const budgetInfo = update.budgetExhausted ? " [budget exhausted]" : "";
-										statusText = `Session ${update.sessionId} running (${formatDurationMs(update.runtime)})${budgetInfo}`;
-									}
-								}
-								const newOutput = update.status === "running" && update.tail.length > 0
-									? `\n\n${update.tail.join("\n")}`
-									: "";
-								onUpdate?.({
-									content: [{ type: "text", text: statusText + newOutput }],
-									details: {
-										status: update.status,
-										sessionId: update.sessionId,
-										runtime: update.runtime,
-										newChars: update.tail.join("\n").length,
-										totalCharsSent: update.totalCharsSent,
-										budgetExhausted: update.budgetExhausted,
-										userTookOver: update.userTookOver,
-									},
-								});
-								pi.events.emit("interactive-shell:update", update);
-							}
-							: undefined,
-						handoffPreviewEnabled: handoffPreview?.enabled,
-						handoffPreviewLines: handoffPreview?.lines,
-						handoffPreviewMaxChars: handoffPreview?.maxChars,
-						handoffSnapshotEnabled: handoffSnapshot?.enabled,
-						handoffSnapshotLines: handoffSnapshot?.lines,
-						handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
-						timeout,
-					}, config, done),
-				createOverlayUiOptions(config),
+							handoff: handoffOpts,
+							storedResult,
+						})(info);
+					})();
+				},
 			);
-		} finally {
-			coordinator.endOverlay();
+			registerHeadlessActive(sessionId, effectiveCommand, effectiveReason, session, monitor, startTime, config, "running", storedResult);
+			return {
+				content: [
+					{
+						type: "text",
+						text: appendWorktreeNotice(
+							`Session dispatched in kitty (id: ${sessionId}).\nYou'll be notified when it completes.\nUse /attach ${sessionId} or interactive_shell({ sessionId: "${sessionId}" }) to inspect it.`,
+							spawnWorktreePath,
+						),
+					},
+				],
+				details: {
+					sessionId,
+					backgroundId: sessionId,
+					mode: mode ?? "dispatch",
+					background: true,
+					spawnAgent,
+					spawnMode,
+					spawnWorktreePath,
+				},
+			};
 		}
 
+		if (mode === "hands-free") {
+			sessionManager.add(effectiveCommand, session, name, effectiveReason, {
+				id: sessionId,
+				noAutoCleanup: true,
+				startedAt: new Date(startTime),
+			});
+			const storedResult: { current: ActiveSessionResult | undefined } = { current: undefined };
+			// Hands-free: agent polls progress; do NOT fire dispatch-style completion turns.
+			const monitor = new HeadlessDispatchMonitor(
+				session,
+				config,
+				{
+					autoExitOnQuiet: handsFree?.autoExitOnQuiet === true,
+					quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
+					gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+					timeout,
+					startedAt: startTime,
+				},
+				(info) => {
+					void (async () => {
+						const artifacts = await buildHandoffArtifacts(session, handoffWhenFromCompletion(info), config, handoffContext, handoffOpts);
+						storedResult.current = {
+							exitCode: info.exitCode,
+							signal: info.signal,
+							backgrounded: false,
+							timedOut: info.timedOut,
+							cancelled: info.cancelled ?? false,
+							completionOutput: info.completionOutput,
+							...artifacts,
+						};
+						persistBackgroundResult(sessionId, storedResult.current);
+						// Keep agent-poll semantics: no triggerTurn completion notification.
+						// Leave active session registered so the agent can query result/handoff;
+						// the first successful poll unregisters (see sessionId query path).
+						// Result stays on background.lastResult for subsequent sessionId queries.
+						scheduleHandsFreeExpiry(sessionId);
+						coordinator.deleteMonitor(sessionId);
+					})();
+				},
+			);
+			registerHandsFreeActive(
+				pi,
+				sessionId,
+				effectiveCommand!,
+				effectiveReason,
+				session,
+				monitor,
+				startTime,
+				config,
+				{
+					updateMode: handsFree?.updateMode ?? config.handsFreeUpdateMode,
+					updateInterval: handsFree?.updateInterval ?? config.handsFreeUpdateInterval,
+					quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
+					updateMaxChars: handsFree?.updateMaxChars ?? config.handsFreeUpdateMaxChars,
+					maxTotalChars: handsFree?.maxTotalChars ?? config.handsFreeMaxTotalChars,
+					emitProgressUpdates: true,
+				},
+				storedResult,
+			);
+			return {
+				content: [
+					{
+						type: "text",
+						text: appendWorktreeNotice(
+							`Session started in kitty: ${sessionId}\nCommand: ${effectiveCommand}\n\nUse interactive_shell({ sessionId: "${sessionId}" }) to check status/output.\nUse interactive_shell({ sessionId: "${sessionId}", kill: true }) to end when done.`,
+							spawnWorktreePath,
+						),
+					},
+				],
+				details: {
+					sessionId,
+					status: "running",
+					command: effectiveCommand,
+					reason: effectiveReason,
+					mode: "hands-free",
+					spawnAgent,
+					spawnMode,
+					spawnWorktreePath,
+				},
+			};
+		}
+
+		// Interactive mode: blocks the agent turn until the kitty session exits.
+		onUpdate?.({
+			content: [{ type: "text", text: appendWorktreeNotice(`Opened kitty session: ${effectiveCommand}`, spawnWorktreePath) }],
+			details: { sessionId, exitCode: null, backgrounded: false, cancelled: false },
+		});
+		sessionManager.add(effectiveCommand, session, name, effectiveReason, {
+			id: sessionId,
+			noAutoCleanup: true,
+			startedAt: new Date(startTime),
+		});
+		const storedResult: { current: ActiveSessionResult | undefined } = { current: undefined };
+		let settled = false;
+		const result = await new Promise<InteractiveShellResult>((resolve) => {
+			let removeAbortListener: (() => void) | undefined;
+			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+			let pendingReason: "exit" | "kill" | "timeout" | undefined;
+			const finish = (partial: InteractiveShellResult) => {
+				if (settled) return;
+				settled = true;
+				removeAbortListener?.();
+				if (timeoutTimer) {
+					clearTimeout(timeoutTimer);
+					timeoutTimer = undefined;
+				}
+				void (async () => {
+					const when = handoffWhenFromCompletion(partial);
+					// For abort/timeout, kill first and wait briefly so shutdown output / real
+					// exit codes can land before we capture handoff artifacts.
+					if ((when === "kill" || when === "timeout") && !session.exited) {
+						session.kill();
+						const graceMs = Math.min(config.kitty?.killGraceMs ?? 5000, 5000);
+						const deadline = Date.now() + graceMs;
+						while (!session.exited && Date.now() < deadline) {
+							await new Promise((r) => setTimeout(r, 50));
+						}
+					}
+					const artifacts = await buildHandoffArtifacts(session, when, config, handoffContext, handoffOpts);
+					const completionOutput = partial.completionOutput ?? (await captureCompletionOutput(session, config));
+					const full: InteractiveShellResult = {
+						...partial,
+						// Prefer real exit status if kill completed within grace.
+						exitCode: session.exited ? session.exitCode : partial.exitCode,
+						signal: session.exited ? session.signal : partial.signal,
+						completionOutput,
+						...artifacts,
+					};
+					storedResult.current = full;
+					persistBackgroundResult(sessionId, full);
+					sessionManager.unregisterActive(sessionId, false);
+					// Keep handoff context until cleanup/dismiss so late queries can still resolve artifacts.
+					sessionManager.scheduleCleanup(sessionId, 5 * 60 * 1000);
+					resolve(full);
+				})();
+			};
+			registerRunningActive(
+				sessionId,
+				effectiveCommand!,
+				effectiveReason,
+				session,
+				startTime,
+				config,
+				() => {
+					// Natural exit wins over a pending abort/timeout reason.
+					if (pendingReason === "timeout") {
+						finish({
+							exitCode: session.exitCode,
+							signal: session.signal,
+							backgrounded: false,
+							cancelled: false,
+							timedOut: true,
+							sessionId,
+						});
+						return;
+					}
+					if (pendingReason === "kill") {
+						finish({
+							exitCode: session.exitCode,
+							signal: session.signal,
+							backgrounded: false,
+							cancelled: true,
+							sessionId,
+						});
+						return;
+					}
+					finish({
+						exitCode: session.exitCode,
+						signal: session.signal,
+						backgrounded: false,
+						cancelled: false,
+						sessionId,
+					});
+				},
+				storedResult,
+			);
+			const abortInteractive = () => {
+				if (session.exited || settled) return;
+				pendingReason = "kill";
+				finish({
+					exitCode: null,
+					backgrounded: false,
+					cancelled: true,
+					sessionId,
+				});
+			};
+			if (signal) {
+				if (signal.aborted) {
+					abortInteractive();
+				} else {
+					signal.addEventListener("abort", abortInteractive, { once: true });
+					removeAbortListener = () => signal.removeEventListener("abort", abortInteractive);
+				}
+			}
+			if (timeout && timeout > 0) {
+				timeoutTimer = setTimeout(() => {
+					timeoutTimer = undefined;
+					if (!session.exited && !settled) {
+						pendingReason = "timeout";
+						finish({
+							exitCode: null,
+							backgrounded: false,
+							cancelled: false,
+							timedOut: true,
+							sessionId,
+						});
+					}
+				}, timeout);
+			}
+		});
 		return {
-			content: [{ type: "text", text: appendWorktreeNotice(summarizeInteractiveResult(effectiveCommand, result, timeout, effectiveReason), spawnWorktreePath) }],
+			content: [
+				{
+					type: "text",
+					text: appendWorktreeNotice(summarizeInteractiveResult(effectiveCommand!, result, timeout, effectiveReason), spawnWorktreePath),
+				},
+			],
 			details: { ...result, spawnAgent, spawnMode, spawnWorktreePath },
 		};
 	};
 	pi.registerShortcut(startupConfig.focusShortcut, {
-		description: "Focus interactive shell overlay",
+		description: "Focus the latest kitty interactive shell session",
 		handler: () => {
-			coordinator.focusOverlay();
+			const latest = sessionManager.list().at(-1);
+			if (!latest?.session.focus) return;
+			try {
+				const maybePromise = latest.session.focus();
+				if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === "function") {
+					(maybePromise as Promise<unknown>).catch((error: unknown) => {
+						console.error("interactive-shell: focus shortcut failed:", error);
+					});
+				}
+			} catch (error) {
+				console.error("interactive-shell: focus shortcut failed:", error);
+			}
 		},
 	});
 	pi.registerShortcut(startupConfig.spawn.shortcut, {
-		description: "Spawn the configured default agent in a fresh interactive shell overlay",
-		handler: (ctx) => spawnOverlay(ctx),
+		description: "Spawn the configured default agent in a managed kitty tab",
+		handler: (ctx) => spawnKittySession(ctx),
 	});
 
 	pi.on("session_start", (_event, ctx) => {
 		coordinator.replaceBackgroundWidgetCleanup(setupBackgroundWidget(ctx, sessionManager, coordinator));
-		terminalInputCleanup?.();
-		terminalInputCleanup = ctx.ui.onTerminalInput((data) => {
-			if (!coordinator.isOverlayOpen()) return undefined;
-			if (isKeyRelease(data) || isKeyRepeat(data)) {
-				return undefined;
-			}
-			if (matchesKey(data, startupConfig.focusShortcut)) {
-				if (coordinator.isOverlayFocused()) {
-					coordinator.unfocusOverlay();
-				} else {
-					coordinator.focusOverlay();
-				}
-				return { consume: true };
-			}
-			if (matchesKey(data, SIDE_CHAT_SHORTCUT)) {
-				ctx.ui.notify("Close pi-interactive-shell first.", "warning");
-				return { consume: true };
-			}
-			return undefined;
-		});
 	});
 
 	pi.on("session_shutdown", () => {
-		terminalInputCleanup?.();
-		terminalInputCleanup = null;
 		coordinator.clearBackgroundWidget();
 		sessionManager.killAll();
 		coordinator.disposeAllMonitors();
@@ -1077,7 +2023,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			"Use this only to delegate tasks to interactive CLI coding agents (pi/claude/cursor/gemini/codex/aider). Prefer mode='dispatch' for fire-and-forget delegations. When sending slash commands or prompts to an existing session, use submit=true so the text is actually submitted.",
 		parameters: toolParameters,
 
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const {
 				command,
 				spawn,
@@ -1117,9 +2063,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			} = params as ToolParams;
 
 			const hasStructuredInput = inputKeys?.length || inputHex?.length || inputPaste;
-			const effectiveInput = hasStructuredInput
-				? { text: input, keys: inputKeys, hex: inputHex, paste: inputPaste }
-				: input;
+			const effectiveInput = hasStructuredInput ? { text: input, keys: inputKeys, hex: inputHex, paste: inputPaste } : input;
 
 			if (spawn && command) {
 				return {
@@ -1207,14 +2151,16 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					};
 				}
 
-				const lines = history.events.map((event) =>
-					`#${event.eventId} [${event.strategy}/${event.triggerId}] ${event.timestamp} :: ${event.matchedText}`,
+				const lines = history.events.map(
+					(event) => `#${event.eventId} [${event.strategy}/${event.triggerId}] ${event.timestamp} :: ${event.matchedText}`,
 				);
 				return {
-					content: [{
-						type: "text",
-						text: `Monitor events for ${targetMonitorSessionId} (${history.events.length}/${history.total}, offset ${history.offset}):\n${lines.join("\n")}`,
-					}],
+					content: [
+						{
+							type: "text",
+							text: `Monitor events for ${targetMonitorSessionId} (${history.events.length}/${history.total}, offset ${history.offset}):\n${lines.join("\n")}`,
+						},
+					],
 					details: {
 						sessionId: targetMonitorSessionId,
 						events: history.events,
@@ -1230,8 +2176,10 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 
 			// ── Branch 1: Interact with existing session ──
 			if (sessionId) {
-				const session = sessionManager.getActive(sessionId);
-				if (!session) {
+				const resolved = resolveSessionById(sessionId);
+				const session = resolved.active;
+				const bgSession = resolved.background;
+				if (!session && !bgSession) {
 					return {
 						content: [{ type: "text", text: `Session not found or no longer active: ${sessionId}` }],
 						isError: true,
@@ -1241,26 +2189,152 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 
 				// Kill
 				if (kill) {
-					const alreadyCompleted = Boolean(session.getResult());
-					if (!alreadyCompleted) {
-						coordinator.markAgentHandledCompletion(sessionId);
-					}
-					const { output, truncated, totalBytes, totalLines, hasMore } = session.getOutput({ skipRateLimit: true, lines: outputLines, maxChars: outputMaxChars, offset: outputOffset, drain, incremental });
-					const status = session.getStatus();
-					const runtime = session.getRuntime();
-					session.kill();
-					sessionManager.unregisterActive(sessionId, true);
+					const killConfig = loadRuntimeConfig(ctx.cwd);
+					const liveMonitor = coordinator.getMonitor(sessionId);
 
-					const truncatedNote = truncated ? ` (${totalBytes} bytes total, truncated)` : "";
-					const hasMoreNote = hasMore === true ? " (more available)" : "";
+					if (session) {
+						const alreadyCompleted = Boolean(session.getResult());
+						if (!alreadyCompleted) {
+							// Suppress the automatic completion turn; this tool call is the response.
+							coordinator.markAgentHandledCompletion(sessionId);
+						}
+						const status = session.getStatus();
+						const runtime = session.getRuntime();
+
+						// Prefer the headless completion pipeline so storedResult / monitor state finalize.
+						if (liveMonitor && !liveMonitor.disposed && !alreadyCompleted) {
+							await new Promise<void>((resolve) => {
+								let done = false;
+								const finishWait = () => {
+									if (done) return;
+									done = true;
+									resolve();
+								};
+								liveMonitor.registerCompleteCallback(finishWait);
+								liveMonitor.cancel();
+								// Bound wait: cancel kicks session.kill() which may take killGraceMs.
+								const graceMs = Math.min(killConfig.kitty?.killGraceMs ?? 5000, 5000);
+								setTimeout(finishWait, graceMs + 500);
+							});
+						} else {
+							session.kill();
+						}
+
+						const { output, truncated, totalBytes, totalLines, hasMore } = await session.getOutput({
+							skipRateLimit: true,
+							lines: outputLines,
+							maxChars: outputMaxChars,
+							offset: outputOffset,
+							drain,
+							incremental,
+						});
+						const killHandoff =
+							(await buildRegisteredHandoffArtifacts(sessionId, "kill")) ??
+							(bgSession
+								? await buildHandoffArtifacts(bgSession.session, "kill", killConfig, { command: session.command, cwd: ctx.cwd })
+								: {});
+						// Completion callbacks may already have unregistered; make cleanup idempotent.
+						sessionManager.unregisterActive(sessionId, true);
+						coordinator.disposeMonitor(sessionId);
+						clearHandoffContext(sessionId);
+						sessionManager.scheduleCleanup(sessionId, 5 * 60 * 1000);
+						scheduleMonitorHistoryCleanup(sessionId);
+
+						const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} killed after ${formatDurationMs(runtime)}${output ? `\n\nFinal output${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+								},
+							],
+							details: {
+								sessionId,
+								status: "killed",
+								runtime,
+								output,
+								outputTruncated: truncated,
+								outputTotalBytes: totalBytes,
+								outputTotalLines: totalLines,
+								hasMore,
+								previousStatus: status,
+								...killHandoff,
+							},
+						};
+					}
+
+					// Background-only kill (active already unregistered after first result poll).
+					const entry = bgSession!;
+					const runtime = Date.now() - entry.startedAt.getTime();
+					if (liveMonitor && !liveMonitor.disposed) {
+						await new Promise<void>((resolve) => {
+							let done = false;
+							const finishWait = () => {
+								if (done) return;
+								done = true;
+								resolve();
+							};
+							liveMonitor.registerCompleteCallback(finishWait);
+							liveMonitor.cancel();
+							const graceMs = Math.min(killConfig.kitty?.killGraceMs ?? 5000, 5000);
+							setTimeout(finishWait, graceMs + 500);
+						});
+					} else if (!entry.session.exited) {
+						entry.session.kill();
+					}
+					const queried = await queryBackgroundSessionOutput(sessionId, entry, ctx.cwd, {
+						outputLines,
+						outputMaxChars,
+						outputOffset,
+						drain,
+						incremental,
+						skipRateLimit: true,
+					});
+					const killHandoff =
+						(await buildRegisteredHandoffArtifacts(sessionId, "kill")) ??
+						(await buildHandoffArtifacts(entry.session, "kill", killConfig, { command: entry.command, cwd: ctx.cwd }));
+					sessionManager.unregisterActive(sessionId, true);
+					coordinator.disposeMonitor(sessionId);
+					clearHandoffContext(sessionId);
+					sessionManager.scheduleCleanup(sessionId, 5 * 60 * 1000);
+					scheduleMonitorHistoryCleanup(sessionId);
+					const { truncatedNote, hasMoreNote } = outputDisplayNotes(queried.truncated, queried.totalBytes, queried.hasMore);
 					return {
-						content: [{ type: "text", text: `Session ${sessionId} killed after ${formatDurationMs(runtime)}${output ? `\n\nFinal output${truncatedNote}${hasMoreNote}:\n${output}` : ""}` }],
-						details: { sessionId, status: "killed", runtime, output, outputTruncated: truncated, outputTotalBytes: totalBytes, outputTotalLines: totalLines, hasMore, previousStatus: status },
+						content: [
+							{
+								type: "text",
+								text: `Session ${sessionId} killed after ${formatDurationMs(runtime)}${queried.output ? `\n\nFinal output${truncatedNote}${hasMoreNote}:\n${queried.output}` : ""}`,
+							},
+						],
+						details: {
+							sessionId,
+							status: "killed",
+							runtime,
+							output: queried.output,
+							outputTruncated: queried.truncated,
+							outputTotalBytes: queried.totalBytes,
+							outputTotalLines: queried.totalLines,
+							hasMore: queried.hasMore,
+							previousStatus: queried.status,
+							...killHandoff,
+						},
 					};
 				}
 
 				// Background
 				if (background) {
+					if (!session) {
+						// Already background-managed (or completed after active unregister).
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} is already managed in kitty; use attach/focus to watch it. Background is a no-op for kitty sessions.`,
+								},
+							],
+							details: { sessionId, alreadyManaged: true },
+						};
+					}
 					if (session.getResult()) {
 						return {
 							content: [{ type: "text", text: "Session already completed." }],
@@ -1275,9 +2349,15 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					const result = session.getResult();
 					if (!result || !result.backgrounded) {
 						coordinator.consumeAgentHandledCompletion(sessionId);
+						// Kitty sessions are already detached managed tabs — background is a no-op.
 						return {
-							content: [{ type: "text", text: `Session ${sessionId} is already running in the background.` }],
-							details: { sessionId },
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} is already managed in kitty; use attach/focus to watch it. Background is a no-op for kitty sessions.`,
+								},
+							],
+							details: { sessionId, alreadyManaged: true },
 						};
 					}
 					sessionManager.unregisterActive(sessionId, false);
@@ -1292,30 +2372,63 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				if (settings?.updateInterval !== undefined) {
 					if (sessionManager.setActiveUpdateInterval(sessionId, settings.updateInterval)) {
 						actions.push(`update interval set to ${settings.updateInterval}ms`);
+					} else if (!session) {
+						return {
+							content: [
+								{ type: "text", text: `Cannot change settings on session ${sessionId}: no longer active (query via sessionId or attach).` },
+							],
+							isError: true,
+							details: { sessionId, error: "settings_not_active" },
+						};
 					}
 				}
 				if (settings?.quietThreshold !== undefined) {
 					if (sessionManager.setActiveQuietThreshold(sessionId, settings.quietThreshold)) {
 						actions.push(`quiet threshold set to ${settings.quietThreshold}ms`);
+					} else if (!session && settings?.updateInterval === undefined) {
+						return {
+							content: [
+								{ type: "text", text: `Cannot change settings on session ${sessionId}: no longer active (query via sessionId or attach).` },
+							],
+							isError: true,
+							details: { sessionId, error: "settings_not_active" },
+						};
 					}
 				}
 
 				if (effectiveInput !== undefined || submit) {
-					const translatedInput = effectiveInput !== undefined ? translateInput(effectiveInput) : "";
-					const finalInput = submit ? `${translatedInput}\r` : translatedInput;
-					const success = sessionManager.writeToActive(sessionId, finalInput);
-					if (!success) {
+					if (session) {
+						const success = await sendStructuredInput(session, sessionId, effectiveInput, submit);
+						if (!success) {
+							return {
+								content: [{ type: "text", text: `Failed to send input to session: ${sessionId}` }],
+								isError: true,
+								details: { sessionId, error: "write_failed" },
+							};
+						}
+					} else if (bgSession && !bgSession.session.exited) {
+						// Active unregistered but kitty tab still running — send via terminal bindings.
+						const success = await sendStructuredInput(
+							{ ...sessionIoBindings(bgSession.session), id: sessionId } as ActiveSession,
+							sessionId,
+							effectiveInput,
+							submit,
+						);
+						if (!success) {
+							return {
+								content: [{ type: "text", text: `Failed to send input to session: ${sessionId}` }],
+								isError: true,
+								details: { sessionId, error: "write_failed" },
+							};
+						}
+					} else {
 						return {
-							content: [{ type: "text", text: `Failed to send input to session: ${sessionId}` }],
+							content: [{ type: "text", text: `Cannot send input to session ${sessionId}: session is no longer active.` }],
 							isError: true,
-							details: { sessionId, error: "write_failed" },
+							details: { sessionId, error: "input_not_active" },
 						};
 					}
-					const inputDesc = effectiveInput === undefined
-						? ""
-						: typeof effectiveInput === "string"
-							? effectiveInput.length === 0 ? "(empty)" : effectiveInput.length > 50 ? `${effectiveInput.slice(0, 50)}...` : effectiveInput
-							: [effectiveInput.text ?? "", effectiveInput.keys ? `keys:[${effectiveInput.keys.join(",")}]` : "", effectiveInput.hex ? `hex:[${effectiveInput.hex.length} bytes]` : "", effectiveInput.paste ? `paste:[${effectiveInput.paste.length} chars]` : ""].filter(Boolean).join(" + ") || "(empty)";
+					const inputDesc = describeInputPayload(effectiveInput);
 					if (submit) {
 						actions.push(inputDesc ? `sent: ${inputDesc} + enter` : "sent: enter");
 					} else {
@@ -1324,83 +2437,186 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				}
 
 				if (actions.length === 0) {
-					const status = session.getStatus();
-					const runtime = session.getRuntime();
-					const result = session.getResult();
-
-					if (result) {
-						const { output, truncated, totalBytes, totalLines, hasMore } = session.getOutput({ skipRateLimit: true, lines: outputLines, maxChars: outputMaxChars, offset: outputOffset, drain, incremental });
-						const truncatedNote = truncated ? ` (${totalBytes} bytes total, truncated)` : "";
-						const hasOutput = output.length > 0;
-						const hasMoreNote = hasMore === true ? " (more available)" : "";
-						sessionManager.unregisterActive(sessionId, !result.backgrounded);
-						return {
-							content: [{ type: "text", text: `Session ${sessionId} ${status} after ${formatDurationMs(runtime)}${hasOutput ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}` }],
-							details: { sessionId, status, runtime, output, outputTruncated: truncated, outputTotalBytes: totalBytes, outputTotalLines: totalLines, hasMore, exitCode: result.exitCode, signal: result.signal, backgroundId: result.backgroundId },
-						};
+					// Background-only query path (after first completed poll unregistered active).
+					if (!session && bgSession) {
+						return getBackgroundOutputResponse(sessionId, bgSession, ctx.cwd, {
+							outputLines,
+							outputMaxChars,
+							outputOffset,
+							drain,
+							incremental,
+						});
 					}
 
-					const outputResult = session.getOutput({ lines: outputLines, maxChars: outputMaxChars, offset: outputOffset, drain, incremental });
+					const activeSession = session!;
+					const status = activeSession.getStatus();
+					const runtime = activeSession.getRuntime();
+					const result = activeSession.getResult();
+
+					if (result) {
+						const outputResult = await activeSession.getOutput({
+							skipRateLimit: true,
+							lines: outputLines,
+							maxChars: outputMaxChars,
+							offset: outputOffset,
+							drain,
+							incremental,
+						});
+						// Keep completion on the background entry, then drop active so further
+						// sessionId queries use the background fallback (with full lastResult).
+						persistBackgroundResult(sessionId, result);
+						sessionManager.unregisterActive(sessionId, result.backgrounded === false);
+						// Peek-based resolve leaves any prior expiry timer intact; re-arm in case
+						// completion had not scheduled yet (race) or a prior get() suspended it.
+						ensureBackgroundExpiry(sessionId);
+						return buildCompletedSessionResponse(sessionId, status, runtime, outputResult, result);
+					}
+
+					const outputResult = await activeSession.getOutput({
+						lines: outputLines,
+						maxChars: outputMaxChars,
+						offset: outputOffset,
+						drain,
+						incremental,
+					});
 
 					if (outputResult.rateLimited && outputResult.waitSeconds) {
 						const waitMs = outputResult.waitSeconds * 1000;
 						const completedEarly = await Promise.race([
 							new Promise<false>((resolve) => setTimeout(() => resolve(false), waitMs)),
-							new Promise<true>((resolve) => session.onComplete(() => resolve(true))),
+							new Promise<true>((resolve) => activeSession.onComplete(() => resolve(true))),
 						]);
 
 						if (completedEarly) {
 							const earlySession = sessionManager.getActive(sessionId);
 							if (!earlySession) {
+								// Completion may have raced unregister; fall back to background if present.
+								const fallbackBg = sessionManager.hasBackground(sessionId) ? sessionManager.get(sessionId) : undefined;
+								if (fallbackBg) {
+									return getBackgroundOutputResponse(sessionId, fallbackBg, ctx.cwd, {
+										outputLines,
+										outputMaxChars,
+										outputOffset,
+										drain,
+										incremental,
+									});
+								}
 								return { content: [{ type: "text", text: `Session ${sessionId} ended` }], details: { sessionId, status: "ended" } };
 							}
 							const earlyResult = earlySession.getResult();
-							const { output, truncated, totalBytes, totalLines, hasMore } = earlySession.getOutput({ skipRateLimit: true, lines: outputLines, maxChars: outputMaxChars, offset: outputOffset, drain, incremental });
+							const { output, truncated, totalBytes, totalLines, hasMore } = await earlySession.getOutput({
+								skipRateLimit: true,
+								lines: outputLines,
+								maxChars: outputMaxChars,
+								offset: outputOffset,
+								drain,
+								incremental,
+							});
 							const earlyStatus = earlySession.getStatus();
 							const earlyRuntime = earlySession.getRuntime();
-							const truncatedNote = truncated ? ` (${totalBytes} bytes total, truncated)` : "";
-							const hasOutput = output.length > 0;
-							const hasMoreNote = hasMore === true ? " (more available)" : "";
+							const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
 							if (earlyResult) {
-								sessionManager.unregisterActive(sessionId, !earlyResult.backgrounded);
-								return {
-									content: [{ type: "text", text: `Session ${sessionId} ${earlyStatus} after ${formatDurationMs(earlyRuntime)}${hasOutput ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}` }],
-									details: { sessionId, status: earlyStatus, runtime: earlyRuntime, output, outputTruncated: truncated, outputTotalBytes: totalBytes, outputTotalLines: totalLines, hasMore, exitCode: earlyResult.exitCode, signal: earlyResult.signal, backgroundId: earlyResult.backgroundId },
-								};
+								persistBackgroundResult(sessionId, earlyResult);
+								sessionManager.unregisterActive(sessionId, earlyResult.backgrounded === false);
+								ensureBackgroundExpiry(sessionId);
+								return buildCompletedSessionResponse(
+									sessionId,
+									earlyStatus,
+									earlyRuntime,
+									{ output, truncated, totalBytes, totalLines, hasMore },
+									earlyResult,
+								);
 							}
 							return {
-								content: [{ type: "text", text: `Session ${sessionId} ${earlyStatus} (${formatDurationMs(earlyRuntime)})${hasOutput ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}` }],
-								details: { sessionId, status: earlyStatus, runtime: earlyRuntime, output, outputTruncated: truncated, outputTotalBytes: totalBytes, outputTotalLines: totalLines, hasMore, hasOutput },
+								content: [
+									{
+										type: "text",
+										text: `Session ${sessionId} ${earlyStatus} (${formatDurationMs(earlyRuntime)})${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+									},
+								],
+								details: {
+									sessionId,
+									status: earlyStatus,
+									runtime: earlyRuntime,
+									output,
+									outputTruncated: truncated,
+									outputTotalBytes: totalBytes,
+									outputTotalLines: totalLines,
+									hasMore,
+									hasOutput: output.length > 0,
+								},
 							};
 						}
 
-						const freshOutput = session.getOutput({ lines: outputLines, maxChars: outputMaxChars, offset: outputOffset, drain, incremental });
-						const truncatedNote = freshOutput.truncated ? ` (${freshOutput.totalBytes} bytes total, truncated)` : "";
-						const hasOutput = freshOutput.output.length > 0;
-						const hasMoreNote = freshOutput.hasMore === true ? " (more available)" : "";
-						const freshStatus = session.getStatus();
-						const freshRuntime = session.getRuntime();
-						const freshResult = session.getResult();
+						const freshOutput = await activeSession.getOutput({
+							lines: outputLines,
+							maxChars: outputMaxChars,
+							offset: outputOffset,
+							drain,
+							incremental,
+						});
+						const { truncatedNote, hasMoreNote } = outputDisplayNotes(freshOutput.truncated, freshOutput.totalBytes, freshOutput.hasMore);
+						const freshStatus = activeSession.getStatus();
+						const freshRuntime = activeSession.getRuntime();
+						const freshResult = activeSession.getResult();
 						if (freshResult) {
-							sessionManager.unregisterActive(sessionId, !freshResult.backgrounded);
-							return {
-								content: [{ type: "text", text: `Session ${sessionId} ${freshStatus} after ${formatDurationMs(freshRuntime)}${hasOutput ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${freshOutput.output}` : ""}` }],
-								details: { sessionId, status: freshStatus, runtime: freshRuntime, output: freshOutput.output, outputTruncated: freshOutput.truncated, outputTotalBytes: freshOutput.totalBytes, outputTotalLines: freshOutput.totalLines, hasMore: freshOutput.hasMore, exitCode: freshResult.exitCode, signal: freshResult.signal, backgroundId: freshResult.backgroundId },
-							};
+							persistBackgroundResult(sessionId, freshResult);
+							sessionManager.unregisterActive(sessionId, freshResult.backgrounded === false);
+							return buildCompletedSessionResponse(
+								sessionId,
+								freshStatus,
+								freshRuntime,
+								{
+									output: freshOutput.output,
+									truncated: freshOutput.truncated,
+									totalBytes: freshOutput.totalBytes,
+									totalLines: freshOutput.totalLines,
+									hasMore: freshOutput.hasMore,
+								},
+								freshResult,
+							);
 						}
 						return {
-							content: [{ type: "text", text: `Session ${sessionId} ${freshStatus} (${formatDurationMs(freshRuntime)})${hasOutput ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${freshOutput.output}` : ""}` }],
-							details: { sessionId, status: freshStatus, runtime: freshRuntime, output: freshOutput.output, outputTruncated: freshOutput.truncated, outputTotalBytes: freshOutput.totalBytes, outputTotalLines: freshOutput.totalLines, hasMore: freshOutput.hasMore, hasOutput },
+							content: [
+								{
+									type: "text",
+									text: `Session ${sessionId} ${freshStatus} (${formatDurationMs(freshRuntime)})${freshOutput.output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${freshOutput.output}` : ""}`,
+								},
+							],
+							details: {
+								sessionId,
+								status: freshStatus,
+								runtime: freshRuntime,
+								output: freshOutput.output,
+								outputTruncated: freshOutput.truncated,
+								outputTotalBytes: freshOutput.totalBytes,
+								outputTotalLines: freshOutput.totalLines,
+								hasMore: freshOutput.hasMore,
+								hasOutput: freshOutput.output.length > 0,
+							},
 						};
 					}
 
 					const { output, truncated, totalBytes, totalLines, hasMore } = outputResult;
-					const truncatedNote = truncated ? ` (${totalBytes} bytes total, truncated)` : "";
-					const hasOutput = output.length > 0;
-					const hasMoreNote = hasMore === true ? " (more available)" : "";
+					const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
 					return {
-						content: [{ type: "text", text: `Session ${sessionId} ${status} (${formatDurationMs(runtime)})${hasOutput ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}` }],
-						details: { sessionId, status, runtime, output, outputTruncated: truncated, outputTotalBytes: totalBytes, outputTotalLines: totalLines, hasMore, hasOutput },
+						content: [
+							{
+								type: "text",
+								text: `Session ${sessionId} ${status} (${formatDurationMs(runtime)})${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+							},
+						],
+						details: {
+							sessionId,
+							status,
+							runtime,
+							output,
+							outputTruncated: truncated,
+							outputTotalBytes: totalBytes,
+							outputTotalLines: totalLines,
+							hasMore,
+							hasOutput: output.length > 0,
+						},
 					};
 				}
 
@@ -1418,22 +2634,9 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				if (!ctx.hasUI) {
-					return {
-						content: [{ type: "text", text: "Attach requires interactive TUI mode" }],
-						isError: true,
-					};
-				}
-				if (coordinator.isOverlayOpen()) {
-					return {
-						content: [{ type: "text", text: "An interactive shell overlay is already open." }],
-						isError: true,
-						details: { error: "overlay_already_open" },
-					};
-				}
 
 				const monitor = coordinator.getMonitor(attach);
-				const bgSession = sessionManager.take(attach);
+				const bgSession = sessionManager.get(attach);
 				if (!bgSession) {
 					disposeStaleMonitor(attach, monitor);
 					return {
@@ -1442,115 +2645,83 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					};
 				}
 
-				const restoreAttachSession = () => {
-					bgSession.session.setEventHandlers({});
-					sessionManager.restore(bgSession, { noAutoCleanup: Boolean(monitor && !monitor.disposed) });
-					return {
-						releaseId: false,
-						disposeMonitor: false,
-					};
-				};
-				if (!coordinator.beginOverlay()) {
-					restoreAttachSession();
-					return {
-						content: [{ type: "text", text: "An interactive shell overlay is already open." }],
-						isError: true,
-						details: { error: "overlay_already_open" },
-					};
-				}
-
 				const config = loadRuntimeConfig(cwd ?? ctx.cwd);
-				const reattachSessionId = attach;
-				const isNonBlocking = mode === "hands-free" || mode === "dispatch";
-				const attachStartTime = bgSession.startedAt.getTime();
-				let overlayPromise: Promise<InteractiveShellResult>;
 				try {
-					overlayPromise = ctx.ui.custom<InteractiveShellResult>(
-						(tui, theme, _kb, done) =>
-							new InteractiveShellOverlay(tui, theme, {
-								command: bgSession.command,
-								existingSession: bgSession.session,
-								sessionId: reattachSessionId,
-								mode,
-								cwd: cwd ?? ctx.cwd,
-								name: bgSession.name,
-								reason: bgSession.reason ?? reason,
-								startedAt: attachStartTime,
-								handsFreeUpdateMode: handsFree?.updateMode,
-								handsFreeUpdateInterval: handsFree?.updateInterval,
-								handsFreeQuietThreshold: handsFree?.quietThreshold,
-								handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
-								handsFreeMaxTotalChars: handsFree?.maxTotalChars,
-								autoExitOnQuiet: mode === "dispatch"
-									? handsFree?.autoExitOnQuiet !== false
-									: handsFree?.autoExitOnQuiet === true,
-								autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-								onUnfocus: () => coordinator.unfocusOverlay(),
-								onHandsFreeUpdate: mode === "hands-free"
-									? makeNonBlockingUpdateHandler(pi)
-									: undefined,
-								handoffPreviewEnabled: handoffPreview?.enabled,
-								handoffPreviewLines: handoffPreview?.lines,
-								handoffPreviewMaxChars: handoffPreview?.maxChars,
-								handoffSnapshotEnabled: handoffSnapshot?.enabled,
-								handoffSnapshotLines: handoffSnapshot?.lines,
-								handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
-								timeout,
-							}, config, done),
-						createOverlayUiOptions(config),
-					);
+					await bgSession.session.focus?.();
 				} catch (error) {
-					coordinator.endOverlay();
-					restoreAttachSession();
-					throw error;
-				}
-
-				if (isNonBlocking) {
-					setupDispatchCompletion(pi, overlayPromise, config, {
-						id: reattachSessionId,
-						mode: mode!,
-						command: bgSession.command,
-						reason: bgSession.reason,
-						timeout,
-						handsFree,
-						overlayStartTime: attachStartTime,
-						onOverlayError: restoreAttachSession,
-					});
+					if (!monitor || monitor.disposed) {
+						sessionManager.restartAutoCleanup(attach);
+					}
 					return {
-						content: [{ type: "text", text: mode === "dispatch"
-							? `Reattached to ${reattachSessionId}. You'll be notified when it completes.`
-							: `Reattached to ${reattachSessionId}.\nUse interactive_shell({ sessionId: "${reattachSessionId}" }) to check status/output.` }],
-						details: { sessionId: reattachSessionId, status: "running", command: bgSession.command, reason: bgSession.reason, mode },
+						content: [
+							{ type: "text", text: `Failed to focus kitty session ${attach}: ${error instanceof Error ? error.message : String(error)}` },
+						],
+						isError: true,
 					};
 				}
 
-				let result: InteractiveShellResult;
-				try {
-					result = await overlayPromise;
-				} catch (error) {
-					restoreAttachSession();
-					throw error;
-				} finally {
-					coordinator.endOverlay();
+				// Reuse manager-owned query state — do not createSessionQueryState() here.
+				// A fresh state resets the incremental cursor so attach pagination restarts at 0.
+				const queryState = sessionManager.getQueryState(attach);
+				const { output, truncated, totalBytes, totalLines, hasMore } = await getSessionOutput(
+					bgSession.session,
+					config,
+					queryState,
+					{
+						skipRateLimit: true,
+						lines: outputLines,
+						maxChars: outputMaxChars,
+						offset: outputOffset,
+						drain,
+						incremental,
+					},
+					bgSession.lastResult?.completionOutput,
+				);
+				// Re-register active while the tab is still running so settings/input via
+				// sessionId work after attach (main reattach re-opened an overlay handle).
+				if (!bgSession.session.exited) {
+					rehydrateActiveFromBackground(attach, config);
 				}
-				if (monitor && !monitor.disposed) {
-					if (!result.backgrounded) {
-						monitor.handleExternalCompletion(result.exitCode, result.signal, result.completionOutput);
-						coordinator.deleteMonitor(attach);
-					} else {
-						const monitoredId = result.backgroundId ?? attach;
-						const monitoredSession = sessionManager.take(monitoredId);
-						if (monitoredSession) {
-							sessionManager.restore(monitoredSession, { noAutoCleanup: true });
-						}
-					}
-				} else if (result.backgrounded) {
+				if (!monitor || monitor.disposed) {
 					sessionManager.restartAutoCleanup(attach);
-				} else {
-					sessionManager.scheduleCleanup(attach);
 				}
-
-				return { content: [{ type: "text", text: summarizeInteractiveResult(command ?? bgSession.command, result, timeout, bgSession.reason ?? reason) }], details: result };
+				const status = statusFromBackground(bgSession);
+				const { truncatedNote, hasMoreNote } = outputDisplayNotes(truncated, totalBytes, hasMore);
+				const runtime = Date.now() - bgSession.startedAt.getTime();
+				const outputBlock = { output, truncated, totalBytes, totalLines, hasMore };
+				if (bgSession.lastResult) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Focused kitty session ${attach} (${status})${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+							},
+						],
+						details: {
+							...completedSessionQueryDetails(attach, status, runtime, outputBlock, bgSession.lastResult),
+							focused: true,
+						},
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Focused kitty session ${attach} (${status})${output ? `\n\nOutput${truncatedNote}${hasMoreNote}:\n${output}` : ""}`,
+						},
+					],
+					details: {
+						sessionId: attach,
+						status,
+						runtime,
+						output,
+						outputTruncated: truncated,
+						outputTotalBytes: totalBytes,
+						outputTotalLines: totalLines,
+						hasMore,
+						focused: true,
+					},
+				};
 			}
 
 			// ── Branch 3: List background sessions ──
@@ -1559,7 +2730,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				if (sessions.length === 0) {
 					return { content: [{ type: "text", text: "No background sessions." }] };
 				}
-				const lines = sessions.map(s => {
+				const lines = sessions.map((s) => {
 					const monitorState = coordinator.getMonitorSessionState(s.id);
 					const status = s.session.exited ? "exited" : "running";
 					const duration = formatDuration(Date.now() - s.startedAt.getTime());
@@ -1575,14 +2746,12 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			// ── Branch 3b: Dismiss background sessions ──
 			if (dismissBackground) {
 				if (typeof dismissBackground === "string") {
-					if (!sessionManager.list().some(s => s.id === dismissBackground)) {
+					if (!sessionManager.list().some((s) => s.id === dismissBackground)) {
 						return { content: [{ type: "text", text: `Background session not found: ${dismissBackground}` }], isError: true };
 					}
 				}
 
-				const targetIds = typeof dismissBackground === "string"
-					? [dismissBackground]
-					: sessionManager.list().map(s => s.id);
+				const targetIds = typeof dismissBackground === "string" ? [dismissBackground] : sessionManager.list().map((s) => s.id);
 
 				if (targetIds.length === 0) {
 					return { content: [{ type: "text", text: "No background sessions to dismiss." }] };
@@ -1592,12 +2761,14 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					coordinator.disposeMonitor(tid);
 					coordinator.clearMonitorEvents(tid);
 					sessionManager.unregisterActive(tid, false);
+					clearHandoffContext(tid);
 					sessionManager.remove(tid);
 				}
 
-				const summary = targetIds.length === 1
-					? `Dismissed session ${targetIds[0]}.`
-					: `Dismissed ${targetIds.length} sessions: ${targetIds.join(", ")}.`;
+				const summary =
+					targetIds.length === 1
+						? `Dismissed session ${targetIds[0]}.`
+						: `Dismissed ${targetIds.length} sessions: ${targetIds.join(", ")}.`;
 				return { content: [{ type: "text", text: summary }] };
 			}
 
@@ -1605,7 +2776,12 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			const allowsGeneratedCommand = mode === "monitor" && monitor?.strategy === "file-watch";
 			if (!command && !spawn && !allowsGeneratedCommand) {
 				return {
-					content: [{ type: "text", text: "One of 'command', 'spawn', 'sessionId', 'attach', 'listBackground', or 'dismissBackground' is required." }],
+					content: [
+						{
+							type: "text",
+							text: "One of 'command', 'spawn', 'sessionId', 'attach', 'listBackground', or 'dismissBackground' is required.",
+						},
+					],
 					isError: true,
 				};
 			}
@@ -1623,17 +2799,26 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				handoffPreview,
 				handoffSnapshot,
 				timeout,
+				signal,
 				onUpdate,
+				input,
+				inputKeys,
+				inputHex,
+				inputPaste,
+				submit,
 			});
 		},
 	});
 
 	pi.registerCommand("spawn", {
-		description: "Spawn the configured default agent, pi, codex, claude, or cursor in an interactive shell overlay",
+		description: "Spawn the configured default agent, pi, codex, claude, or cursor in a managed kitty tab",
 		handler: async (args, ctx) => {
 			const parsed = parseSpawnArgs(args);
 			if (!parsed.ok) {
-				ctx.ui.notify(`${parsed.error}\nUsage: /spawn [pi|codex|claude|cursor] [fresh|fork] [--worktree] [\"prompt\" --hands-free|--dispatch]`, "error");
+				ctx.ui.notify(
+					`${parsed.error}\nUsage: /spawn [pi|codex|claude|cursor] [fresh|fork] [--worktree] [\"prompt\" --hands-free|--dispatch]`,
+					"error",
+				);
 				return;
 			}
 			if (parsed.parsed.monitorMode) {
@@ -1647,18 +2832,13 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				}
 				return;
 			}
-			await spawnOverlay(ctx, parsed.parsed.request);
+			await spawnKittySession(ctx, parsed.parsed.request);
 		},
 	});
 
 	pi.registerCommand("attach", {
-		description: "Reattach to a background shell session",
+		description: "Focus a background kitty shell session",
 		handler: async (args, ctx) => {
-			if (coordinator.isOverlayOpen()) {
-				ctx.ui.notify("An overlay is already open. Close it first.", "error");
-				return;
-			}
-
 			const sessions = sessionManager.list();
 			if (sessions.length === 0) {
 				ctx.ui.notify("No background sessions", "info");
@@ -1678,73 +2858,35 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						label: `${s.id} - ${sanitizedCommand}${r} (${status}, ${duration})`,
 					};
 				});
-				const choice = await ctx.ui.select("Background Sessions", options.map((o) => o.label));
+				const choice = await ctx.ui.select(
+					"Background Sessions",
+					options.map((o) => o.label),
+				);
 				if (!choice) return;
 				targetId = options.find((o) => o.label === choice)!.id;
 			}
 
 			const monitor = coordinator.getMonitor(targetId);
-			if (!coordinator.beginOverlay()) {
-				ctx.ui.notify("An overlay is already open. Close it first.", "error");
-				return;
-			}
-
 			const session = sessionManager.get(targetId);
 			if (!session) {
 				disposeStaleMonitor(targetId, monitor);
-				coordinator.endOverlay();
 				ctx.ui.notify(`Session not found: ${targetId}`, "error");
 				return;
 			}
 
-			const restoreBackgroundLifecycle = () => {
-				session.session.setEventHandlers({});
-				if (monitor && !monitor.disposed) {
-					return;
-				}
-				if (session.session.exited) {
-					sessionManager.scheduleCleanup(targetId);
-					return;
-				}
-				sessionManager.restartAutoCleanup(targetId);
-			};
-
-			const config = loadRuntimeConfig(ctx.cwd);
 			try {
-				const result = await ctx.ui.custom<InteractiveShellResult>(
-					(tui, theme, _kb, done) =>
-						new ReattachOverlay(
-							tui,
-							theme,
-							{ id: session.id, command: session.command, reason: session.reason, session: session.session },
-							config,
-							done,
-							() => coordinator.unfocusOverlay(),
-						),
-					createOverlayUiOptions(config),
-				);
-
-				emitTransferredOutput(pi, result, targetId);
-
-				if (monitor && !monitor.disposed) {
-					if (!result.backgrounded) {
-						if (result.transferred) {
-							coordinator.markAgentHandledCompletion(targetId);
-						}
-						monitor.handleExternalCompletion(result.exitCode, result.signal, result.completionOutput);
-						coordinator.deleteMonitor(targetId);
-					}
-				} else if (result.backgrounded) {
-					sessionManager.restartAutoCleanup(targetId);
-				} else {
-					sessionManager.scheduleCleanup(targetId);
-				}
+				await session.session.focus?.();
 			} catch (error) {
-				restoreBackgroundLifecycle();
-				throw error;
-			} finally {
-				coordinator.endOverlay();
+				if (!monitor || monitor.disposed) {
+					sessionManager.restartAutoCleanup(targetId);
+				}
+				ctx.ui.notify(`Failed to focus session ${targetId}: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
 			}
+			if (!monitor || monitor.disposed) {
+				sessionManager.restartAutoCleanup(targetId);
+			}
+			ctx.ui.notify(`Focused session ${targetId}`, "info");
 		},
 	});
 
@@ -1760,7 +2902,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			let targetIds: string[];
 			const arg = args.trim();
 			if (arg) {
-				if (!sessions.some(s => s.id === arg)) {
+				if (!sessions.some((s) => s.id === arg)) {
 					ctx.ui.notify(`Session not found: ${arg}`, "error");
 					return;
 				}
@@ -1776,7 +2918,10 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						return { id: s.id, label: `${s.id} (${status}, ${duration})` };
 					}),
 				];
-				const choice = await ctx.ui.select("Dismiss sessions", options.map((o) => o.label));
+				const choice = await ctx.ui.select(
+					"Dismiss sessions",
+					options.map((o) => o.label),
+				);
 				if (!choice) return;
 				const selected = options.find((o) => o.label === choice);
 				targetIds = selected?.id ? [selected.id] : sessions.map((s) => s.id);
@@ -1786,116 +2931,12 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				coordinator.disposeMonitor(tid);
 				coordinator.clearMonitorEvents(tid);
 				sessionManager.unregisterActive(tid, false);
+				clearHandoffContext(tid);
 				sessionManager.remove(tid);
 			}
 
 			const noun = targetIds.length === 1 ? "session" : "sessions";
 			ctx.ui.notify(`Dismissed ${targetIds.length} ${noun}`, "info");
 		},
-	});
-}
-
-function setupDispatchCompletion(
-	pi: ExtensionAPI,
-	overlayPromise: Promise<InteractiveShellResult>,
-	config: InteractiveShellConfig,
-	ctx: {
-		id: string;
-		mode: string;
-		command: string;
-		reason?: string;
-		timeout?: number;
-		handsFree?: { autoExitOnQuiet?: boolean; quietThreshold?: number; gracePeriod?: number };
-		overlayStartTime?: number;
-		onOverlayError?: () => { releaseId?: boolean; disposeMonitor?: boolean } | void;
-	},
-): void {
-	const { id, mode, command, reason } = ctx;
-
-	overlayPromise.then((result) => {
-		coordinator.endOverlay();
-
-		const wasAgentInitiated = coordinator.consumeAgentHandledCompletion(id);
-
-		if (result.transferred) {
-			emitTransferredOutput(pi, result, id);
-			sessionManager.unregisterActive(id, true);
-			coordinator.disposeMonitor(id);
-			return;
-		}
-
-		if (mode === "dispatch" && result.backgrounded) {
-			if (!wasAgentInitiated) {
-				pi.sendMessage({
-					customType: "interactive-shell-transfer",
-					content: `Session ${id} moved to background (id: ${result.backgroundId}).`,
-					display: true,
-					details: { sessionId: id, backgroundId: result.backgroundId },
-				}, { triggerTurn: true });
-			}
-
-			const bgId = result.backgroundId!;
-			const existingMonitor = coordinator.getMonitor(id);
-			const bgSession = sessionManager.get(bgId);
-			if (!bgSession) {
-				sessionManager.unregisterActive(id, true);
-				coordinator.disposeMonitor(id);
-				return;
-			}
-
-			sessionManager.unregisterActive(id, bgId !== id);
-
-			if (existingMonitor && !existingMonitor.disposed) {
-				coordinator.deleteMonitor(id);
-				registerHeadlessActive(bgId, command, reason, bgSession.session, existingMonitor, bgSession.startedAt.getTime(), config);
-				return;
-			}
-
-			const elapsed = ctx.overlayStartTime ? Date.now() - ctx.overlayStartTime : 0;
-			const remainingTimeout = ctx.timeout ? Math.max(0, ctx.timeout - elapsed) : undefined;
-			const bgStartTime = bgSession.startedAt.getTime();
-			const monitor = new HeadlessDispatchMonitor(bgSession.session, config, {
-				autoExitOnQuiet: ctx.handsFree?.autoExitOnQuiet !== false,
-				quietThreshold: ctx.handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
-				gracePeriod: ctx.handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-				timeout: remainingTimeout,
-				startedAt: bgStartTime,
-			}, makeMonitorCompletionCallback(pi, bgId, bgStartTime));
-			registerHeadlessActive(bgId, command, reason, bgSession.session, monitor, bgStartTime, config);
-			return;
-		}
-
-		if (mode === "dispatch") {
-			if (!wasAgentInitiated) {
-				const content = buildResultNotification(id, result);
-				pi.sendMessage({
-					customType: "interactive-shell-transfer",
-					content,
-					display: true,
-					details: { sessionId: id, exitCode: result.exitCode, signal: result.signal, timedOut: result.timedOut, cancelled: result.cancelled, completionOutput: result.completionOutput },
-				}, { triggerTurn: true });
-			}
-			pi.events.emit("interactive-shell:transfer", {
-				sessionId: id,
-				completionOutput: result.completionOutput,
-				exitCode: result.exitCode,
-				signal: result.signal,
-				timedOut: result.timedOut,
-				cancelled: result.cancelled,
-			});
-			sessionManager.unregisterActive(id, true);
-			coordinator.disposeMonitor(id);
-			return;
-		}
-
-		coordinator.disposeMonitor(id);
-	}).catch((error) => {
-		console.error(`interactive-shell: overlay error for session ${id}:`, error);
-		coordinator.endOverlay();
-		const recovery = ctx.onOverlayError?.();
-		sessionManager.unregisterActive(id, recovery?.releaseId ?? true);
-		if (recovery?.disposeMonitor !== false) {
-			coordinator.disposeMonitor(id);
-		}
 	});
 }

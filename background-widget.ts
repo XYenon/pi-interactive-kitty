@@ -43,21 +43,36 @@ export function setupBackgroundWidget(
 					for (const s of sessions) {
 						const monitorState = coordinator?.getMonitorSessionState(s.id);
 						const exited = s.session.exited;
-						const dot = exited
-							? theme.fg("dim", "○")
-							: monitorState
-								? theme.fg("accent", "◆")
-								: theme.fg("accent", "●");
+						let dot: string;
+						if (exited) {
+							dot = theme.fg("dim", "○");
+						} else if (monitorState) {
+							dot = theme.fg("accent", "◆");
+						} else {
+							dot = theme.fg("accent", "●");
+						}
 						const id = theme.fg("dim", s.id);
 						const cmd = s.command.replace(/\s+/g, " ").trim();
 						const truncCmd = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
 						const reason = s.reason ? theme.fg("dim", ` · ${s.reason}`) : "";
-						const statusText = monitorState
-							? `${monitorState.status === "running" ? "monitoring" : "monitor-stopped"}${monitorState.eventCount > 0 ? ` e:${monitorState.eventCount}` : ""}`
-							: exited
-								? "exited"
-								: "running";
-						const status = exited ? theme.fg("dim", statusText) : monitorState ? theme.fg("accent", statusText) : theme.fg("success", statusText);
+						let statusText: string;
+						if (monitorState) {
+							const base = monitorState.status === "running" ? "monitoring" : "monitor-stopped";
+							const events = monitorState.eventCount > 0 ? ` e:${monitorState.eventCount}` : "";
+							statusText = `${base}${events}`;
+						} else if (exited) {
+							statusText = "exited";
+						} else {
+							statusText = "running";
+						}
+						let status: string;
+						if (exited) {
+							status = theme.fg("dim", statusText);
+						} else if (monitorState) {
+							status = theme.fg("accent", statusText);
+						} else {
+							status = theme.fg("success", statusText);
+						}
 						const duration = theme.fg("dim", formatDuration(Date.now() - s.startedAt.getTime()));
 						const strategy = monitorState ? theme.fg("dim", ` · ${monitorState.strategy}`) : "";
 						const oneLine = ` ${dot} ${id}  ${truncCmd}${reason}${strategy}  ${status} ${duration}`;

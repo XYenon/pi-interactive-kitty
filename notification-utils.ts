@@ -5,7 +5,7 @@ import { formatDurationMs } from "./types.js";
 const BRIEF_TAIL_LINES = 5;
 
 export function buildDispatchNotification(sessionId: string, info: HeadlessCompletionInfo, duration: string): string {
-	const parts = [buildDispatchStatusLine(sessionId, info, duration)];
+	const parts = [buildSessionStatusLine(sessionId, info, duration)];
 	if (info.completionOutput && info.completionOutput.totalLines > 0) {
 		parts.push(` ${info.completionOutput.totalLines} lines of output.`);
 	}
@@ -15,11 +15,9 @@ export function buildDispatchNotification(sessionId: string, info: HeadlessCompl
 }
 
 export function buildResultNotification(sessionId: string, result: InteractiveShellResult): string {
-	const parts = [buildResultStatusLine(sessionId, result)];
+	const parts = [buildSessionStatusLine(sessionId, result)];
 	if (result.completionOutput && result.completionOutput.lines.length > 0) {
-		const truncNote = result.completionOutput.truncated
-			? ` (truncated from ${result.completionOutput.totalLines} total lines)`
-			: "";
+		const truncNote = result.completionOutput.truncated ? ` (truncated from ${result.completionOutput.totalLines} total lines)` : "";
 		parts.push(`\nOutput (${result.completionOutput.lines.length} lines${truncNote}):\n\n${result.completionOutput.lines.join("\n")}`);
 	}
 	return parts.join("");
@@ -39,14 +37,18 @@ export function buildMonitorEventNotification(event: MonitorEventPayload): strin
 export function buildMonitorLifecycleNotification(state: MonitorSessionState): string {
 	const reason = state.terminalReason ?? "stopped";
 	let headline: string;
-	if (reason === "stream-ended") {
-		headline = `Monitor ${state.sessionId} stream ended.`;
-	} else if (reason === "timed-out") {
-		headline = `Monitor ${state.sessionId} timed out.`;
-	} else if (reason === "script-failed") {
-		headline = `Monitor ${state.sessionId} script failed.`;
-	} else {
-		headline = `Monitor ${state.sessionId} stopped.`;
+	switch (reason) {
+		case "stream-ended":
+			headline = `Monitor ${state.sessionId} stream ended.`;
+			break;
+		case "timed-out":
+			headline = `Monitor ${state.sessionId} timed out.`;
+			break;
+		case "script-failed":
+			headline = `Monitor ${state.sessionId} script failed.`;
+			break;
+		default:
+			headline = `Monitor ${state.sessionId} stopped.`;
 	}
 
 	const details: string[] = [
@@ -97,8 +99,8 @@ export function summarizeInteractiveResult(command: string, result: InteractiveS
 		summary += "\n\nNote: User took over control during hands-free mode.";
 	}
 
-	if (!result.transferred && result.handoffPreview?.type === "tail" && result.handoffPreview.lines.length > 0) {
-		summary += `\n\nOverlay tail (${result.handoffPreview.when}, last ${result.handoffPreview.lines.length} lines):\n${result.handoffPreview.lines.join("\n")}`;
+	if (result.handoffPreview?.type === "tail" && result.handoffPreview.lines.length > 0) {
+		summary += `\n\nSession tail (${result.handoffPreview.when}, last ${result.handoffPreview.lines.length} lines):\n${result.handoffPreview.lines.join("\n")}`;
 	}
 
 	const warning = buildIdlePromptWarning(command, reason);
@@ -135,25 +137,19 @@ export function buildIdlePromptWarning(command: string, reason: string | undefin
 	return `Note: \`reason\` is UI-only. This command likely started the agent idle. If you intended an initial prompt, embed it in \`command\`, e.g. \`${bin} "${clipped}"\`.`;
 }
 
-function buildDispatchStatusLine(sessionId: string, info: HeadlessCompletionInfo, duration: string): string {
-	if (info.timedOut) return `Session ${sessionId} timed out (${duration}).`;
-	if (info.cancelled) return `Session ${sessionId} was killed (${duration}).`;
-	if (info.exitCode === 0) return `Session ${sessionId} completed successfully (${duration}).`;
-	return `Session ${sessionId} exited with code ${info.exitCode} (${duration}).`;
-}
-
-function buildResultStatusLine(sessionId: string, result: InteractiveShellResult): string {
-	if (result.timedOut) return `Session ${sessionId} timed out.`;
-	if (result.cancelled) return `Session ${sessionId} was killed.`;
-	if (result.exitCode === 0) return `Session ${sessionId} completed successfully.`;
-	return `Session ${sessionId} exited with code ${result.exitCode}.`;
+function buildSessionStatusLine(
+	sessionId: string,
+	info: { timedOut?: boolean; cancelled?: boolean; exitCode?: number | null },
+	duration?: string,
+): string {
+	const suffix = duration ? ` (${duration})` : "";
+	if (info.timedOut) return `Session ${sessionId} timed out${suffix}.`;
+	if (info.cancelled) return `Session ${sessionId} was killed${suffix}.`;
+	if (info.exitCode === 0) return `Session ${sessionId} completed successfully${suffix}.`;
+	return `Session ${sessionId} exited with code ${info.exitCode}${suffix}.`;
 }
 
 function buildInteractiveSummary(result: InteractiveShellResult, timeout?: number): string {
-	if (result.transferred) {
-		const truncatedNote = result.transferred.truncated ? ` (truncated from ${result.transferred.totalLines} total lines)` : "";
-		return `Session output transferred (${result.transferred.lines.length} lines${truncatedNote}):\n\n${result.transferred.lines.join("\n")}`;
-	}
 	if (result.backgrounded) {
 		return `Session running in background (id: ${result.backgroundId}). User can reattach with /attach ${result.backgroundId}`;
 	}

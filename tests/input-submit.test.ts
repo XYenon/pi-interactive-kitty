@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 async function setupHarness() {
+	const activeSession: any = {
+		write: vi.fn(),
+		paste: vi.fn(),
+		sendKeys: vi.fn(),
+	};
 	const sessionManager = {
-		getActive: vi.fn(() => ({ })),
+		getActive: vi.fn(() => activeSession),
 		writeToActive: vi.fn(() => true),
 		setActiveUpdateInterval: vi.fn(() => false),
 		setActiveQuietThreshold: vi.fn(() => false),
@@ -11,6 +16,9 @@ async function setupHarness() {
 		add: vi.fn(() => "mock-session-id"),
 		list: vi.fn(() => []),
 		get: vi.fn(() => undefined),
+		hasBackground: vi.fn(() => false),
+		peekBackground: vi.fn(() => undefined),
+		getQueryState: vi.fn(() => ({ lastQueryTime: 0, incrementalReadPosition: 0, incrementalCharOffset: 0 })),
 		take: vi.fn(() => undefined),
 		restore: vi.fn(),
 		remove: vi.fn(),
@@ -54,6 +62,7 @@ async function setupHarness() {
 	return {
 		tool: registeredTool,
 		sessionManager,
+		activeSession,
 		ctx: {
 			cwd: "/tmp/project",
 			hasUI: true,
@@ -87,33 +96,123 @@ describe("interactive_shell submit input helper", () => {
 		const harness = await setupHarness();
 		expect(harness.tool).toBeTruthy();
 
-		const result = await harness.tool!.execute("call-1", {
-			sessionId: "sess-1",
-			input: "/run manual-slash-check summarize src/alpha.ts in 2 short bullets",
-			submit: true,
-		}, undefined, undefined, harness.ctx as any);
-
-		expect(harness.sessionManager.writeToActive).toHaveBeenCalledWith(
-			"sess-1",
-			"/run manual-slash-check summarize src/alpha.ts in 2 short bullets\r",
+		const result = await harness.tool!.execute(
+			"call-1",
+			{
+				sessionId: "sess-1",
+				input: "/run manual-slash-check summarize src/alpha.ts in 2 short bullets",
+				submit: true,
+			},
+			undefined,
+			undefined,
+			harness.ctx as any,
 		);
+
+		expect(harness.activeSession.write).toHaveBeenCalledWith("/run manual-slash-check summarize src/alpha.ts in 2 short bullets\r");
 		expect(result.content[0].text).toContain("sent: /run manual-slash-check summarize src/alpha.ts ");
 		expect(result.content[0].text).toContain("+ enter");
+	});
+
+	it("returns write_failed when async input delivery rejects", async () => {
+		const harness = await setupHarness();
+		expect(harness.tool).toBeTruthy();
+		harness.activeSession.writeAsync = vi.fn().mockRejectedValue(new Error("remote control failed"));
+
+		const result = await harness.tool!.execute(
+			"call-1",
+			{
+				sessionId: "sess-1",
+				input: "/run fails",
+				submit: true,
+			},
+			undefined,
+			undefined,
+			harness.ctx as any,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.details).toEqual({ sessionId: "sess-1", error: "write_failed" });
+		expect(harness.activeSession.writeAsync).toHaveBeenCalledWith("/run fails\r");
 	});
 
 	it("appends Enter after structured paste input when submit=true", async () => {
 		const harness = await setupHarness();
 		expect(harness.tool).toBeTruthy();
 
-		await harness.tool!.execute("call-1", {
-			sessionId: "sess-2",
-			inputPaste: "/run review",
-			submit: true,
-		}, undefined, undefined, harness.ctx as any);
-
-		expect(harness.sessionManager.writeToActive).toHaveBeenCalledWith(
-			"sess-2",
-			"\x1b[200~/run review\x1b[201~\r",
+		await harness.tool!.execute(
+			"call-1",
+			{
+				sessionId: "sess-2",
+				inputPaste: "/run review",
+				submit: true,
+			},
+			undefined,
+			undefined,
+			harness.ctx as any,
 		);
+
+		// Prefer text-path CR after paste (same delivery family as plain input+\r) over a
+		// separate send-key, which can race paste on independent kitty RC sockets.
+		expect(harness.activeSession.paste).toHaveBeenCalledWith("/run review");
+		expect(harness.activeSession.write).toHaveBeenCalledWith("\r");
+		expect(harness.activeSession.sendKeys).not.toHaveBeenCalled();
+	});
+
+	it("uses sendInputSequence for ordered paste+submit when available", async () => {
+		const harness = await setupHarness();
+		expect(harness.tool).toBeTruthy();
+		const sendInputSequence = vi.fn().mockResolvedValue(undefined);
+		harness.activeSession.sendInputSequence = sendInputSequence;
+
+		await harness.tool!.execute(
+			"call-1",
+			{
+				sessionId: "sess-3",
+				inputPaste: "/run ordered",
+				submit: true,
+			},
+			undefined,
+			undefined,
+			harness.ctx as any,
+		);
+
+		expect(sendInputSequence).toHaveBeenCalledWith({
+			text: undefined,
+			paste: "/run ordered",
+			keys: undefined,
+			submit: true,
+		});
+		expect(harness.activeSession.paste).not.toHaveBeenCalled();
+		expect(harness.activeSession.sendKeys).not.toHaveBeenCalled();
+	});
+
+	it("restarts background cleanup when attach focus fails", async () => {
+		const harness = await setupHarness();
+		expect(harness.tool).toBeTruthy();
+
+		harness.sessionManager.get.mockReturnValueOnce({
+			id: "bg-1",
+			name: "bg-1",
+			command: "pi",
+			session: {
+				exited: false,
+				focus: vi.fn().mockRejectedValue(new Error("window closed")),
+			},
+			startedAt: new Date(),
+		});
+
+		const result = await harness.tool!.execute(
+			"call-1",
+			{
+				attach: "bg-1",
+			},
+			undefined,
+			undefined,
+			harness.ctx as any,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("Failed to focus kitty session bg-1");
+		expect(harness.sessionManager.restartAutoCleanup).toHaveBeenCalledWith("bg-1");
 	});
 });
