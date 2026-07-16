@@ -66,6 +66,15 @@ export class KittyClient {
 		this.connectTimeoutMs = kitty?.connectTimeoutMs ?? 5000;
 	}
 
+	/**
+	 * Identity of the remote-control socket this client targets.
+	 * Used for process-local caches that must not leak across kitty instances
+	 * (e.g. scrollback_lines overrides).
+	 */
+	get remoteControlTarget(): string {
+		return this.listenOn || "(unset)";
+	}
+
 	async command<T = unknown>(command: KittyCommand): Promise<KittyResponse<T>> {
 		this.requireListenOn();
 		const payload = this.encodeWirePayload(command);
@@ -171,9 +180,54 @@ export class KittyClient {
 	}
 
 	async sendText(windowId: number, data: Buffer | string, options: { bracketedPaste?: "disable" | "auto" | "enable" } = {}): Promise<void> {
+		const frames = this.buildSendTextFrames(windowId, data, options.bracketedPaste ?? "disable");
+		// Multi-chunk pastes must share one socket so open/body/close markers stay ordered.
+		this.requireListenOn();
+		await this.sendNoResponseBatch(frames);
+	}
+
+	/**
+	 * Low-level send-key. Callers must only pass recognized keysyms/modifiers —
+	 * kitty silently drops literal/non-keysym strings and still reports success.
+	 * Prefer KittyTerminalSession.sendKeysAsync, which routes via isNamedKey.
+	 */
+	async sendKeys(windowId: number, keys: string[]): Promise<void> {
+		if (keys.length === 0) return;
+		this.requireListenOn();
+		await this.sendNoResponseBatch([this.buildSendKeyFrame(windowId, keys)]);
+	}
+
+	/**
+	 * Send multiple text/key steps on a **single** remote-control socket, in order.
+	 * Independent sockets have no protocol ordering guarantee — paste then Enter as
+	 * separate connections can reverse at kitty and submit an empty prompt.
+	 */
+	async sendOrdered(
+		windowId: number,
+		steps: Array<
+			{ kind: "text"; data: string | Buffer; bracketedPaste?: "disable" | "auto" | "enable" } | { kind: "keys"; keys: string[] }
+		>,
+	): Promise<void> {
+		if (steps.length === 0) return;
+		const frames: Buffer[] = [];
+		for (const step of steps) {
+			if (step.kind === "text") {
+				if (step.data.length === 0 && typeof step.data === "string") continue;
+				if (Buffer.isBuffer(step.data) && step.data.length === 0) continue;
+				frames.push(...this.buildSendTextFrames(windowId, step.data, step.bracketedPaste ?? "disable"));
+			} else if (step.keys.length > 0) {
+				frames.push(this.buildSendKeyFrame(windowId, step.keys));
+			}
+		}
+		if (frames.length === 0) return;
+		this.requireListenOn();
+		await this.sendNoResponseBatch(frames);
+	}
+
+	/** Build no_response send-text wire frames (chunked, optional bracketed paste). */
+	private buildSendTextFrames(windowId: number, data: Buffer | string, requested: "disable" | "auto" | "enable" = "disable"): Buffer[] {
 		let bytes = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
 		const chunkSize = 1024;
-		const requested = options.bracketedPaste ?? "disable";
 		// kitty only accepts disable|auto|enable per send-text call (no start/end).
 		// Multi-chunk is decided on the *raw* payload length so sanitize shrinking
 		// cannot leave multi-chunk + native enable (which would wrap each chunk).
@@ -205,20 +259,13 @@ export class KittyClient {
 				}),
 			);
 		}
-		// Multi-chunk pastes must share one socket so open/body/close markers stay ordered.
-		this.requireListenOn();
-		await this.sendNoResponseBatch(frames);
+		return frames;
 	}
 
-	/**
-	 * Low-level send-key. Callers must only pass recognized keysyms/modifiers —
-	 * kitty silently drops literal/non-keysym strings and still reports success.
-	 * Prefer KittyTerminalSession.sendKeysAsync, which routes via isNamedKey.
-	 */
-	async sendKeys(windowId: number, keys: string[]): Promise<void> {
-		if (keys.length === 0) return;
-		await this.command({
+	private buildSendKeyFrame(windowId: number, keys: string[]): Buffer {
+		return this.encodeWirePayload({
 			cmd: "send-key",
+			version: this.version,
 			no_response: true,
 			payload: {
 				match: `id:${windowId}`,

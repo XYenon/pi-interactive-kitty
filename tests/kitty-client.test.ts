@@ -237,6 +237,28 @@ describe("KittyClient.sendText bracketed paste chunking", () => {
 		expect(body.toString("utf8")).toBe("a".repeat(1020) + "b".repeat(20));
 	});
 
+	it("sendOrdered batches paste then submit CR on one socket", async () => {
+		const client = await createClient();
+		const batches: Buffer[][] = [];
+		(client as any).sendNoResponseBatch = async (payloads: Buffer[]) => {
+			batches.push(payloads.map((p) => Buffer.from(p)));
+		};
+		await client.sendOrdered(1, [
+			{ kind: "text", data: "/run review", bracketedPaste: "enable" },
+			{ kind: "text", data: "\r" },
+		]);
+		expect(batches.length).toBe(1);
+		expect(batches[0]!.length).toBe(2);
+		const cmds = batches[0]!.map((frame) => {
+			const raw = frame.toString("utf8");
+			return JSON.parse(raw.slice(DCS_PREFIX.length, -DCS_SUFFIX.length));
+		});
+		expect(cmds.map((c) => c.cmd)).toEqual(["send-text", "send-text"]);
+		expect(cmds[0].payload.bracketed_paste).toBe("enable");
+		expect(Buffer.from(cmds[0].payload.data.slice("base64:".length), "base64").toString("utf8")).toBe("/run review");
+		expect(Buffer.from(cmds[1].payload.data.slice("base64:".length), "base64").toString("utf8")).toBe("\r");
+	});
+
 	it("reconstructs multi-byte UTF-8 that straddles a chunk boundary", async () => {
 		const client = await createClient();
 		// U+1F600 is 4 UTF-8 bytes; place it across the 1024-byte boundary.

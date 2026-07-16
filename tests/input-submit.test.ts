@@ -150,8 +150,39 @@ describe("interactive_shell submit input helper", () => {
 			harness.ctx as any,
 		);
 
+		// Prefer text-path CR after paste (same delivery family as plain input+\r) over a
+		// separate send-key, which can race paste on independent kitty RC sockets.
 		expect(harness.activeSession.paste).toHaveBeenCalledWith("/run review");
-		expect(harness.activeSession.sendKeys).toHaveBeenCalledWith(["enter"]);
+		expect(harness.activeSession.write).toHaveBeenCalledWith("\r");
+		expect(harness.activeSession.sendKeys).not.toHaveBeenCalled();
+	});
+
+	it("uses sendInputSequence for ordered paste+submit when available", async () => {
+		const harness = await setupHarness();
+		expect(harness.tool).toBeTruthy();
+		const sendInputSequence = vi.fn().mockResolvedValue(undefined);
+		harness.activeSession.sendInputSequence = sendInputSequence;
+
+		await harness.tool!.execute(
+			"call-1",
+			{
+				sessionId: "sess-3",
+				inputPaste: "/run ordered",
+				submit: true,
+			},
+			undefined,
+			undefined,
+			harness.ctx as any,
+		);
+
+		expect(sendInputSequence).toHaveBeenCalledWith({
+			text: undefined,
+			paste: "/run ordered",
+			keys: undefined,
+			submit: true,
+		});
+		expect(harness.activeSession.paste).not.toHaveBeenCalled();
+		expect(harness.activeSession.sendKeys).not.toHaveBeenCalled();
 	});
 
 	it("restarts background cleanup when attach focus fails", async () => {

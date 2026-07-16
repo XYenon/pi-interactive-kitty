@@ -842,6 +842,9 @@ function sessionIoBindings(session: TerminalSession) {
 		writeAsync: session.writeAsync ? (data: string) => session.writeAsync!(data) : undefined,
 		sendKeysAsync: session.sendKeysAsync ? (keys: string[]) => session.sendKeysAsync!(keys) : undefined,
 		pasteAsync: session.pasteAsync ? (text: string) => session.pasteAsync!(text) : undefined,
+		sendInputSequence: session.sendInputSequence
+			? (options: { text?: string; paste?: string; keys?: string[]; submit?: boolean }) => session.sendInputSequence!(options)
+			: undefined,
 		focus: () => session.focus?.(),
 	};
 }
@@ -1182,16 +1185,38 @@ async function sendStructuredInput(
 		if (input.text) {
 			raw += input.text;
 		}
+		// Prefer a single ordered RC batch (paste + keys + Enter on one socket) so kitty
+		// cannot process submit before paste when connections are independent.
+		if (typeof session.sendInputSequence === "function") {
+			await session.sendInputSequence({
+				text: raw || undefined,
+				paste: input.paste,
+				keys: input.keys,
+				submit,
+			});
+			return true;
+		}
 		if (raw) {
-			await write(raw);
+			// Keep submit on the text path when possible (same as plain-string input).
+			const trailingKeys = input.keys ?? [];
+			const submitViaText = Boolean(submit) && trailingKeys.length === 0 && !input.paste;
+			await write(submitViaText ? `${raw}\r` : raw);
+			if (submitViaText) return true;
 		}
 		if (input.paste) {
+			const trailingKeys = input.keys ?? [];
+			const submitViaText = Boolean(submit) && trailingKeys.length === 0;
 			if (typeof session.pasteAsync === "function") {
 				await session.pasteAsync(input.paste);
 			} else if (typeof session.paste === "function") {
 				session.paste(input.paste);
 			} else {
 				await write(translateInput({ paste: input.paste }));
+			}
+			// Fall back to text-path CR rather than a separate send-key when no other keys.
+			if (submitViaText) {
+				await write("\r");
+				return true;
 			}
 		}
 		const keys = [...(input.keys ?? [])];
@@ -1204,6 +1229,8 @@ async function sendStructuredInput(
 			} else {
 				await write(translateInput({ keys }));
 			}
+		} else if (submit && !raw && !input.paste) {
+			await write("\r");
 		}
 		return true;
 	} catch (error) {

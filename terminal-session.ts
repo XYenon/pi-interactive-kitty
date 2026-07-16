@@ -36,6 +36,11 @@ export interface TerminalSession {
 	writeAsync?(data: string): Promise<void>;
 	sendKeysAsync?(keys: string[]): Promise<void>;
 	pasteAsync?(text: string): Promise<void>;
+	/**
+	 * Ordered text/paste/keys/submit delivery (single RC batch when supported).
+	 * Prefer this over separate paste + sendKeys when submit ordering matters.
+	 */
+	sendInputSequence?(options: { text?: string; paste?: string; keys?: string[]; submit?: boolean }): Promise<void>;
 	focus?(): Promise<void>;
 	resize(cols: number, rows: number): void;
 	/** Live kitty get-text (viewport). Falls back to last successful fetch if the window is gone. */

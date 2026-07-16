@@ -41,25 +41,31 @@ function withLaunchLock<T>(fn: () => Promise<T>): Promise<T> {
 	return run;
 }
 
-/** Last scrollback_lines value pushed to the controlled kitty via load-config -o. */
-let appliedKittyScrollbackLines: number | undefined;
+/**
+ * Last scrollback_lines value pushed per kitty remote-control target via load-config -o.
+ * Keyed by socket identity so a second kitty instance (or a restarted one after cache
+ * would otherwise skip) still receives the override when the line count matches.
+ */
+const appliedKittyScrollbackByTarget = new Map<string, number>();
 
 /**
  * Ensure the kitty instance creates new windows with the desired scrollback.
  * Implemented as `kitten @ load-config -o scrollback_lines=N` (CLI override form).
- * Cached so we do not reload config on every tab launch when the value is unchanged.
+ * Cached per remote-control target so we do not reload config on every tab launch
+ * when the value is unchanged for that instance.
  */
 async function ensureKittyScrollbackLines(client: KittyClient, lines: number): Promise<void> {
 	const target = Math.trunc(lines);
 	if (!Number.isFinite(target) || target === 0) return;
-	if (appliedKittyScrollbackLines === target) return;
+	const cacheKey = client.remoteControlTarget;
+	if (appliedKittyScrollbackByTarget.get(cacheKey) === target) return;
 	await client.loadConfig({ overrides: [`scrollback_lines=${target}`] });
-	appliedKittyScrollbackLines = target;
+	appliedKittyScrollbackByTarget.set(cacheKey, target);
 }
 
 /** Test-only: reset process-local scrollback override cache. */
 export function __resetKittyScrollbackCacheForTests(): void {
-	appliedKittyScrollbackLines = undefined;
+	appliedKittyScrollbackByTarget.clear();
 }
 
 export class KittyTerminalSession implements TerminalSession {
@@ -267,6 +273,76 @@ export class KittyTerminalSession implements TerminalSession {
 			await this.ready;
 			if (this._exited) throw new Error("session has exited");
 			await this.client.sendText(this.windowId, text, { bracketedPaste: "enable" });
+		});
+	}
+
+	/**
+	 * Deliver text / bracketed paste / keys / optional Enter as one ordered remote-control
+	 * batch on a single socket. Avoids paste-then-submit races where independent sockets
+	 * let kitty process Enter before paste and submit an empty prompt.
+	 */
+	async sendInputSequence(options: { text?: string; paste?: string; keys?: string[]; submit?: boolean }): Promise<void> {
+		const hasText = Boolean(options.text);
+		const hasPaste = Boolean(options.paste);
+		const keys = options.keys ?? [];
+		const submit = options.submit === true;
+		if (!hasText && !hasPaste && keys.length === 0 && !submit) return;
+		if (this._exited) throw new Error("session has exited");
+
+		await this.queue.enqueue(async () => {
+			await this.ready;
+			if (this._exited) throw new Error("session has exited");
+
+			type Step =
+				| { kind: "text"; data: string | Buffer; bracketedPaste?: "disable" | "auto" | "enable" }
+				| { kind: "keys"; keys: string[] };
+			const steps: Step[] = [];
+
+			if (options.text) {
+				steps.push({ kind: "text", data: options.text });
+			}
+			if (options.paste) {
+				steps.push({ kind: "text", data: options.paste, bracketedPaste: "enable" });
+			}
+
+			// Prefer send-text CR for bare submit so Enter stays on the text/paste path.
+			// When other keys are present, append "enter" to the key batch (same socket).
+			const keySteps = [...keys];
+			if (submit) {
+				if (keySteps.length === 0) {
+					steps.push({ kind: "text", data: "\r" });
+				} else {
+					keySteps.push("enter");
+				}
+			}
+
+			// Same named-key / literal split as sendKeysAsync so multi-char strings are not
+			// dropped by send-key, while still batching everything onto one socket.
+			let textBuf = "";
+			let keyBuf: string[] = [];
+			const flushText = () => {
+				if (!textBuf) return;
+				steps.push({ kind: "text", data: textBuf });
+				textBuf = "";
+			};
+			const flushKeys = () => {
+				if (keyBuf.length === 0) return;
+				steps.push({ kind: "keys", keys: keyBuf });
+				keyBuf = [];
+			};
+			for (const key of keySteps) {
+				if (isNamedKey(key)) {
+					flushText();
+					keyBuf.push(key);
+				} else {
+					flushKeys();
+					textBuf += key;
+				}
+			}
+			flushText();
+			flushKeys();
+
+			await this.client.sendOrdered(this.windowId, steps);
 		});
 	}
 

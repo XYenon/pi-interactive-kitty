@@ -210,6 +210,7 @@ describe("KittyTerminalSession poll transient failures", () => {
 		const launch = vi.fn().mockResolvedValue(42);
 		const getText = vi.fn().mockResolvedValue("hello\n");
 		const ls = mockLsWithManagedWindow();
+		let remoteControlTarget = "unix:/tmp/kitty-a";
 
 		vi.doMock("@mariozechner/pi-coding-agent", () => ({
 			getAgentDir: () => "/tmp/pi-agent-kitty-session-test",
@@ -219,6 +220,9 @@ describe("KittyTerminalSession poll transient failures", () => {
 			return {
 				...actual,
 				KittyClient: class MockKittyClient {
+					get remoteControlTarget() {
+						return remoteControlTarget;
+					}
 					loadConfig = loadConfig;
 					launch = launch;
 					getText = getText;
@@ -249,7 +253,7 @@ describe("KittyTerminalSession poll transient failures", () => {
 		await session.ready;
 		expect(loadConfig).toHaveBeenCalledWith({ overrides: ["scrollback_lines=7777"] });
 		expect(launch).toHaveBeenCalled();
-		// Second session with same value should not re-apply.
+		// Second session with same value on the same kitty target should not re-apply.
 		loadConfig.mockClear();
 		const session2 = new KittyTerminalSession({ command: "echo hi", id: "scrollback-apply-2" }, {
 			scrollbackLines: 7777,
@@ -264,8 +268,26 @@ describe("KittyTerminalSession poll transient failures", () => {
 		} as any);
 		await session2.ready;
 		expect(loadConfig).not.toHaveBeenCalled();
+
+		// Different remote-control target must re-apply even with the same line count.
+		remoteControlTarget = "unix:/tmp/kitty-b";
+		loadConfig.mockClear();
+		const session3 = new KittyTerminalSession({ command: "echo hi", id: "scrollback-apply-3" }, {
+			scrollbackLines: 7777,
+			kitty: {
+				version: [0, 47, 4] as [number, number, number],
+				responseTimeoutMs: 5000,
+				pollIntervalMs: 500,
+				osWindowTitle: "test",
+				tabTitlePrefix: "pi-shell",
+				focusNewSessions: false,
+			},
+		} as any);
+		await session3.ready;
+		expect(loadConfig).toHaveBeenCalledWith({ overrides: ["scrollback_lines=7777"] });
 		session.dispose();
 		session2.dispose();
+		session3.dispose();
 	});
 
 	it("does not mark exited on a single getText failure", async () => {
