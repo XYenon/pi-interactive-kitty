@@ -344,43 +344,44 @@ interactive_shell({ sessionId: "shell-1", inputKeys: ["down", "down", "enter"] }
 interactive_shell({ sessionId: "shell-1", inputKeys: ["ctrl+c"] });
 ```
 
-### Named Keys
+### Named Keys (kitty `send-key` keysyms only)
 
-| Key                                                       | Description       |
-| --------------------------------------------------------- | ----------------- |
-| `up`, `down`, `left`, `right`                             | Arrow keys        |
-| `enter`, `return`                                         | Enter/Return      |
-| `escape`, `esc`                                           | Escape            |
-| `tab`, `shift+tab` (or `btab`)                            | Tab / Back-tab    |
-| `backspace`, `bspace`                                     | Backspace         |
-| `delete`, `del`, `dc`                                     | Delete            |
-| `insert`, `ic`                                            | Insert            |
-| `home`, `end`                                             | Home/End          |
-| `pageup`, `pgup`, `ppage`                                 | Page Up           |
-| `pagedown`, `pgdn`, `npage`                               | Page Down         |
-| `f1`-`f12`                                                | Function keys     |
-| `kp0`-`kp9`, `kp/`, `kp*`, `kp-`, `kp+`, `kp.`, `kpenter` | Keypad keys       |
-| `ctrl+c`, `ctrl+d`, `ctrl+z`                              | Control sequences |
-| `ctrl+a` through `ctrl+z`                                 | All control keys  |
+`inputKeys` is forwarded to kitty remote-control `send-key`. Use only keysyms kitty accepts
+(see kitty `parse_shortcut` / keyboard docs). Join modifiers with **`+` only** (not `-`).
 
-Note: `ic`/`dc`, `ppage`/`npage`, `bspace` are tmux-style aliases for compatibility.
+| Key                                                                                             | Description                 |
+| ----------------------------------------------------------------------------------------------- | --------------------------- |
+| `up`, `down`, `left`, `right`                                                                   | Arrows (`arrowup`… also ok) |
+| `enter`, `return`                                                                               | Enter                       |
+| `escape`, `esc`                                                                                 | Escape                      |
+| `tab`, `shift+tab`                                                                              | Tab / Back-tab              |
+| `backspace`                                                                                     | Backspace                   |
+| `delete`, `del`                                                                                 | Delete                      |
+| `insert`                                                                                        | Insert                      |
+| `home`, `end`                                                                                   | Home / End                  |
+| `page_up`, `pageup`, `pgup`                                                                     | Page Up                     |
+| `page_down`, `pagedown`, `pgdn`                                                                 | Page Down                   |
+| `f1`–`f35`                                                                                      | Function keys               |
+| `kp_0`–`kp_9`, `kp_enter`, `kp_add`, `kp_subtract`, `kp_multiply`, `kp_divide`, `kp_decimal`, … | Keypad (underscore form)    |
+| `space` / `spc`                                                                                 | Space                       |
+| `ctrl+c`, `ctrl+d`, `alt+x`, `opt+x`, `shift+tab`, `cmd+c` / `super+c`                          | Modified keys               |
 
-### Modifier Combinations
+**Modifiers** (prefix, joined with `+`): `ctrl`/`control`, `alt`/`opt`/`option`, `shift`, `super`/`cmd`/`command`, `hyper`, `kitty`.
 
-Supports `ctrl+`, `alt+`, `shift+` prefixes (or shorthand `c-`, `m-`, `s-`):
+**Not accepted** (silently dropped by kitty or not parsed): `c-c`, `m-x`, `s-tab`, `ctrl-c` (hyphen), tmux aliases (`bspace`, `btab`, `dc`, `ic`, `ppage`, `npage`), compact keypad (`kp0`, `kp+`).
 
 ```typescript
 // Cancel
 inputKeys: ["ctrl+c"];
 
-// Alt+Tab
-inputKeys: ["alt+tab"];
+// Alt+x / Option+x
+inputKeys: ["alt+x"]; // or opt+x
 
 // Ctrl+Alt+Delete
 inputKeys: ["ctrl+alt+delete"];
 
-// Shorthand syntax
-inputKeys: ["c-c", "m-x", "s-tab"];
+// Back-tab
+inputKeys: ["shift+tab"];
 ```
 
 ### Hex Bytes (Advanced)

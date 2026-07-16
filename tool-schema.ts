@@ -64,8 +64,10 @@ SENDING INPUT:
 - interactive_shell({ sessionId: "calm-reef", inputHex: ["0x1b", "0x5b", "0x41"] }) - raw escape sequences
 - interactive_shell({ sessionId: "calm-reef", inputPaste: "multiline\\ntext" }) - bracketed paste (prevents auto-execution)
 
-Named keys for inputKeys: up, down, left, right, enter, escape, tab, backspace, ctrl+c, ctrl+d, etc.
-Modifiers: ctrl+x, alt+x, shift+tab, ctrl+alt+delete (or c-x, m-x, s-tab syntax)
+inputKeys use kitty send-key keysyms only (joined with \`+\`, not \`-\`):
+- Functional: up/down/left/right, enter/return, escape/esc, tab, backspace, delete/del, insert, home, end, page_up/pageup/pgup, page_down/pagedown/pgdn, f1–f35, kp_0–kp_9, kp_enter, kp_add, kp_subtract, …
+- Modifiers: ctrl+/control+, alt+/opt+/option+, shift+, super+/cmd+/command+, hyper+, kitty+ (e.g. ctrl+c, alt+x, shift+tab, ctrl+alt+delete)
+- Not accepted: c-/m-/s- shorthands, tmux aliases (bspace, btab, dc, ic), bare multi-char literals
 For editor-based TUIs like pi, raw \`input\` only types text. It does NOT submit by itself. Prefer \`submit: true\` or \`inputKeys: ["enter"]\` instead of relying on \`\\n\`.
 
 TIMEOUT (for TUI commands that don't exit cleanly):
@@ -218,7 +220,7 @@ export const toolParameters = Type.Object({
 	inputKeys: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Named keys with modifier support: up, down, enter, ctrl+c, alt+x, shift+tab, ctrl+alt+delete, etc. (requires sessionId)",
+				"kitty send-key keysyms only (join mods with +): enter, up, f1, page_up, kp_enter, ctrl+c, alt+x, shift+tab, ctrl+alt+delete, cmd+c. No c-/m-/s- shorthands. (requires sessionId)",
 		}),
 	),
 	inputHex: Type.Optional(

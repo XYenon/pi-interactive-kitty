@@ -228,11 +228,9 @@ export class KittyTerminalSession implements TerminalSession {
 			await this.ready;
 			if (this._exited) throw new Error("session has exited");
 			// Pitfall: kitty send-key only delivers recognized keysyms and always reports
-			// success even when nothing is typed — single chars can be dropped under
-			// alternate-screen/TUI keyboard modes, and multi-char non-keysyms ("abc",
-			// "++", "你好") are always dropped. Route literals through send-text (reliable);
-			// keep named/modified keys (ctrl+c, enter, up, f1, ...) on send-key.
-			// Flush text/key batches in order so mixed sequences stay ordered.
+			// success even when nothing is typed. isNamedKey() matches kitty parse_shortcut
+			// vocabulary (ctrl+c, enter, page_up, kp_enter, …) — not c-/m-/s- or tmux aliases.
+			// Literals and unknown tokens go through send-text. Flush batches in order.
 			let textBuf = "";
 			let keyBuf: string[] = [];
 			const flushText = async () => {

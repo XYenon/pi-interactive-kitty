@@ -294,9 +294,10 @@ interactive_shell({ sessionId: "calm-reef", input: "SELECT * FROM users;" });
 // Type text and press Enter
 interactive_shell({ sessionId: "calm-reef", input: "SELECT * FROM users;", submit: true });
 
-// Named keys
+// Named keys (kitty send-key keysyms; join mods with +, e.g. ctrl+c — not c-c)
 interactive_shell({ sessionId: "calm-reef", inputKeys: ["ctrl+c"] });
 interactive_shell({ sessionId: "calm-reef", inputKeys: ["down", "down", "enter"] });
+interactive_shell({ sessionId: "calm-reef", inputKeys: ["shift+tab", "alt+x", "page_up"] });
 
 // Bracketed paste (multiline without execution)
 interactive_shell({ sessionId: "calm-reef", inputPaste: "line1\nline2\nline3" });
